@@ -519,12 +519,13 @@ mod tests {
 
     #[test]
     fn file_server_missing_file_returns_404() {
-        let h = file_server("/tmp".to_owned());
+        let dir = std::env::temp_dir();
+        let h = file_server(dir.to_str().unwrap().to_owned());
         let r = dummy_request("/this_file_does_not_exist_xyz.bin");
         let mut w = RecordingWriter::new();
         h.serve_http(&mut w, &r);
         let out = String::from_utf8(w.bytes()).unwrap();
-        assert!(out.contains("404"));
+        assert!(out.contains("404"), "expected 404 in response, got: {}", out);
     }
 
     #[test]
