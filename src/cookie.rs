@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /// Cookie and CookieJar — port of Go net/http cookie handling.
 use std::time::SystemTime;
 

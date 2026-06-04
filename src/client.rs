@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /// Client, Transport, and RoundTripper — port of Go's net/http client.
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};

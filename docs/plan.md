@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Plan: `go-http` — Port of Go `net/http` to Rust
 
 ## Guiding principles

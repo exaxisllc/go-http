@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // 1xx
 pub const CONTINUE: u16 = 100;
 pub const SWITCHING_PROTOCOLS: u16 = 101;

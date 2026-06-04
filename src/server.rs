@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /// Server — port of Go's net/http Server.
 ///
 /// Goroutine-per-connection model backed by go-lib.

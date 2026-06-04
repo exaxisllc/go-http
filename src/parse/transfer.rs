@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /// Body framing — port of Go net/http `readTransfer` / `writeTransfer`.
 ///
 /// Resolves whether a message has a body and how it is framed (chunked vs

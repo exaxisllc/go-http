@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # go-http — HTTP/1.1 Server & Client in Rust
 
 A faithful port of Go's `net/http` library to Rust, built on [go-lib](https://github.com/exaxisllc/go-lib) for goroutine-style concurrency.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /// Utility functions — port of Go net/http helpers.
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /// Response and ResponseWriter — port of Go's `net/http.Response` and
 /// `net/http.ResponseWriter`.
 use std::io::{self, Read, Write};

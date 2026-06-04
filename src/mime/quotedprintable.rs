@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /// Quoted-printable codec — port of Go's `mime/quotedprintable`.
 use std::io::{self, Read, Write};
 

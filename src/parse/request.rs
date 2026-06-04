@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /// HTTP/1.1 request parser — port of Go net/http `readRequest`.
 use std::io::Read;
 

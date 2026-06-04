@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 pub const GET: &str = "GET";
 pub const HEAD: &str = "HEAD";
 pub const POST: &str = "POST";

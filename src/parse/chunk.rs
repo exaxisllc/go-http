@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /// Chunked transfer encoding reader/writer — port of Go's `internal/chunked`.
 use std::io::{self, Read, Write};
 

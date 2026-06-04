@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /// Port of Go's `mime` package.
 ///
 /// Covers `ParseMediaType`, `FormatMediaType`, `ExtensionsByType`,

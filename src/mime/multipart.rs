@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /// Multipart reader/writer — port of Go's `mime/multipart`.
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};

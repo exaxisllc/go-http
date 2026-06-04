@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /// TLS configuration helpers.
 ///
 /// Thin wrappers around `rustls` and `rustls-pemfile` that load server

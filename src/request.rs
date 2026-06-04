@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /// Request — port of Go's `net/http.Request`.
 use std::collections::HashMap;
 use std::io::Read;
