@@ -194,7 +194,7 @@ mod tests {
         let mut decoded = Vec::new();
         r.read_to_end(&mut decoded).unwrap();
         // The decoded result normalises CRLF → LF.
-        let orig_lf: Vec<u8> = original
+        let _orig_lf: Vec<u8> = original
             .windows(2)
             .enumerate()
             .filter_map(|(i, w)| if w == b"\r\n" { None } else { Some(original[i]) })

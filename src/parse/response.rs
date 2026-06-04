@@ -180,6 +180,7 @@ mod tests {
         );
         // 999 is technically in range 100–999 per our check, so OK; spot-check
         // a truly invalid one:
+        assert!(result.is_ok(), "status 999 should be valid");
         let result2 = read_response(
             Cursor::new(b"HTTP/1.1 abc Bad\r\n\r\n"),
             None,
