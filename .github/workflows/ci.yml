@@ -41,13 +41,25 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: cargo test
-        # --nocapture: print test output immediately so crash context is
-        # visible in the job log even when the process exits abnormally
-        # (e.g. STATUS_ACCESS_VIOLATION on Windows).
-        # timeout-minutes: guard against a run_impl park() hang on slow runners.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: cargo test (unit tests)
+        # Run the lib unit tests with plain cargo test — they have no go_lib::run()
+        # calls and finish in under 1 second.
+        timeout-minutes: 5
+        run: cargo test --lib -- --nocapture
+
+      - name: cargo nextest run (integration tests)
+        # nextest runs each integration test in its own subprocess.
+        # This is required because go_lib's goroutine scheduler is a
+        # process-global singleton: background goroutines spawned by one test
+        # (e.g. the HTTP server goroutine in listen_and_serve) keep running
+        # after go_lib::run() returns, and on Linux/epoll their stale state
+        # corrupts the next test's scheduler → SIGSEGV.  Running each test
+        # in its own OS process gives each test a clean scheduler instance.
         timeout-minutes: 10
-        run: cargo test -- --nocapture
+        run: cargo nextest run --test middleware --test server_client
 
       - name: Print Windows VEH crash file (if present)
         if: runner.os == 'Windows'
@@ -105,8 +117,14 @@ jobs:
           rustup component add llvm-tools-preview --toolchain ${{ matrix.toolchain }}
       - name: Install coverage tool
         run: cargo +stable install cargo-llvm-cov --locked
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
       - name: Test project and generate coverage report
-        run: cargo llvm-cov --remap-path-prefix --show-missing-lines --branch --doctests --lcov --output-path lcov.info
+        # Use `cargo llvm-cov nextest` so that each test runs in its own
+        # subprocess — required because go_lib's goroutine scheduler is a
+        # process-global singleton that causes SIGSEGV on Linux/epoll when
+        # multiple integration tests share a process.
+        run: cargo llvm-cov nextest --remap-path-prefix --show-missing-lines --branch --lcov --output-path lcov.info
       - name: Publish coverage summary to job summary
         uses: livewing/lcov-job-summary@v1.1.0
         with:
