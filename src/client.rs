@@ -582,42 +582,52 @@ mod tests {
     fn client_get_end_to_end() {
         use crate::handler::ServeMux;
         use crate::server::Server;
+        use std::time::Duration;
 
         let port = 19083u16;
         let addr = format!("127.0.0.1:{port}");
-        let addr2 = addr.clone();
 
-        std::thread::spawn(move || {
-            go_lib::run(move || {
-                let mux = Arc::new(ServeMux::new());
-                mux.handle_func("/hello", |w, _r| {
-                    w.header().set("Content-Type", "text/plain");
-                    let _ = w.write(b"Hello from server\n");
-                });
-                let mut srv = Server::new(addr2);
+        // Run server and client in the same go_lib::run() context to avoid
+        // cross-scheduler socket issues on Windows. Server runs as a goroutine,
+        // client runs in the main goroutine with retries.
+        go_lib::run(move || {
+            let mux = Arc::new(ServeMux::new());
+            mux.handle_func("/hello", |w, _r| {
+                w.header().set("Content-Type", "text/plain");
+                let _ = w.write(b"Hello from server\n");
+            });
+
+            let addr_copy = addr.clone();
+            go_lib::go!(move || {
+                let mut srv = Server::new(addr_copy);
                 srv.handler = Some(mux);
                 let _ = srv.listen_and_serve();
             });
-        });
 
-        std::thread::sleep(std::time::Duration::from_millis(150));
+            // Give the server time to bind the listener.
+            go_lib::sleep(Duration::from_millis(50));
 
-        // Try with retry.
-        for _ in 0..10 {
-            let result = go_lib::run(move || {
+            // Try with retry to handle slow scheduler startup.
+            for attempt in 0..10 {
                 let client = Client::new();
-                client.get(&format!("http://127.0.0.1:{port}/hello"))
-            });
-            match result {
-                Ok(mut resp) => {
-                    assert_eq!(resp.status, 200);
-                    let body = resp.body_string().unwrap();
-                    assert!(body.contains("Hello from server"), "body: {body:?}");
-                    return;
+                match client.get(&format!("http://127.0.0.1:{port}/hello")) {
+                    Ok(mut resp) => {
+                        assert_eq!(resp.status, 200, "Expected 200, got {}", resp.status);
+                        let body = resp.body_string().unwrap();
+                        assert!(
+                            body.contains("Hello from server"),
+                            "body does not contain expected text: {body:?}"
+                        );
+                        return;
+                    }
+                    Err(_) if attempt < 9 => {
+                        go_lib::sleep(Duration::from_millis(50));
+                    }
+                    Err(e) => {
+                        panic!("client could not reach test server after 10 attempts: {e}");
+                    }
                 }
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
             }
-        }
-        panic!("client could not reach test server");
+        });
     }
 }
