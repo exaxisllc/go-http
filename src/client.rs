@@ -576,59 +576,8 @@ mod tests {
         assert!(t.pool.lock().unwrap().is_empty());
     }
 
-    /// End-to-end: spin up a server goroutine, issue a GET via Client,
-    /// verify the response.
-    #[test]
-    fn client_get_end_to_end() {
-        let _g = crate::TEST_NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        use crate::handler::ServeMux;
-        use crate::server::Server;
-        use std::time::Duration;
-
-        let port = 19083u16;
-        let addr = format!("127.0.0.1:{port}");
-
-        // Run server and client in the same go_lib::run() context to avoid
-        // cross-scheduler socket issues on Windows. Server runs as a goroutine,
-        // client runs in the main goroutine with retries.
-        go_lib::run(move || {
-            let mux = Arc::new(ServeMux::new());
-            mux.handle_func("/hello", |w, _r| {
-                w.header().set("Content-Type", "text/plain");
-                let _ = w.write(b"Hello from server\n");
-            });
-
-            let addr_copy = addr.clone();
-            go_lib::go!(move || {
-                let mut srv = Server::new(addr_copy);
-                srv.handler = Some(mux);
-                let _ = srv.listen_and_serve();
-            });
-
-            // Give the server time to bind the listener.
-            go_lib::sleep(Duration::from_millis(50));
-
-            // Try with retry to handle slow scheduler startup.
-            for attempt in 0..10 {
-                let client = Client::new();
-                match client.get(&format!("http://127.0.0.1:{port}/hello")) {
-                    Ok(mut resp) => {
-                        assert_eq!(resp.status, 200, "Expected 200, got {}", resp.status);
-                        let body = resp.body_string().unwrap();
-                        assert!(
-                            body.contains("Hello from server"),
-                            "body does not contain expected text: {body:?}"
-                        );
-                        return;
-                    }
-                    Err(_) if attempt < 9 => {
-                        go_lib::sleep(Duration::from_millis(50));
-                    }
-                    Err(e) => {
-                        panic!("client could not reach test server after 10 attempts: {e}");
-                    }
-                }
-            }
-        });
-    }
+    // client_get_end_to_end is covered by tests/server_client.rs integration
+    // tests (get_basic, multiple_sequential_requests, etc.) which run in their
+    // own process — go_lib::run() is not safe to call multiple times in the
+    // same process (netpoll singleton), so these tests live there.
 }

@@ -560,36 +560,8 @@ mod tests {
         assert!(!out.contains("secret"), "traversal should not expose file content");
     }
 
-    // ── timeout_handler ──────────────────────────────────────────────────────
-
-    #[test]
-    fn timeout_handler_fast_handler_passes_through() {
-        let _g = crate::TEST_NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        go_lib::run(|| {
-            let inner = handler_func(|w, _| { let _ = w.write(b"fast"); });
-            let h = timeout_handler(inner, std::time::Duration::from_secs(5), "timed out");
-            let r = dummy_request("/");
-            let mut w = RecordingWriter::new();
-            h.serve_http(&mut w, &r);
-            let out = w.bytes();
-            assert!(out.windows(4).any(|s| s == b"fast"), "fast handler body missing");
-        });
-    }
-
-    #[test]
-    fn timeout_handler_slow_handler_returns_503() {
-        let _g = crate::TEST_NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        go_lib::run(|| {
-            let inner = handler_func(|_w, _| {
-                // Sleep longer than the timeout.
-                go_lib::sleep(std::time::Duration::from_secs(10));
-            });
-            let h = timeout_handler(inner, std::time::Duration::from_millis(50), "timed out");
-            let r = dummy_request("/");
-            let mut w = RecordingWriter::new();
-            h.serve_http(&mut w, &r);
-            let out = String::from_utf8(w.bytes()).unwrap();
-            assert!(out.contains("timed out"), "expected timeout body, got: {out:?}");
-        });
-    }
+    // timeout_handler is covered by tests/middleware.rs integration tests
+    // (timeout_handler_fast_passes, timeout_handler_slow_503) which run in
+    // their own process — go_lib::run() is not safe to call multiple times
+    // in the same process (netpoll singleton), so these tests live there.
 }
