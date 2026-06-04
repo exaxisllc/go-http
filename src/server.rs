@@ -493,6 +493,7 @@ mod tests {
     /// there is no interaction with any goroutine scheduler.
     #[test]
     fn end_to_end_hello() {
+        let _g = crate::TEST_NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let port = 19082u16;
         let addr = format!("127.0.0.1:{port}");
         let addr2 = addr.clone();

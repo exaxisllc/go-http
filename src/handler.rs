@@ -564,6 +564,7 @@ mod tests {
 
     #[test]
     fn timeout_handler_fast_handler_passes_through() {
+        let _g = crate::TEST_NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         go_lib::run(|| {
             let inner = handler_func(|w, _| { let _ = w.write(b"fast"); });
             let h = timeout_handler(inner, std::time::Duration::from_secs(5), "timed out");
@@ -577,6 +578,7 @@ mod tests {
 
     #[test]
     fn timeout_handler_slow_handler_returns_503() {
+        let _g = crate::TEST_NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         go_lib::run(|| {
             let inner = handler_func(|_w, _| {
                 // Sleep longer than the timeout.

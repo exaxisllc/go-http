@@ -580,6 +580,7 @@ mod tests {
     /// verify the response.
     #[test]
     fn client_get_end_to_end() {
+        let _g = crate::TEST_NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::handler::ServeMux;
         use crate::server::Server;
         use std::time::Duration;
