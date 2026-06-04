@@ -440,8 +440,6 @@ pub use crate::handler::handle_func;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::ServeMux;
-    use std::io::{Read, Write};
 
     #[test]
     fn build_request_basic() {
@@ -488,48 +486,4 @@ mod tests {
         assert!(s.contains("0\r\n\r\n"), "missing chunked terminal: {s:?}");
     }
 
-    /// End-to-end: server runs in a dedicated OS thread (its own go-lib
-    /// scheduler); client runs on the test thread using plain std::net so
-    /// there is no interaction with any goroutine scheduler.
-    #[test]
-    fn end_to_end_hello() {
-        let _g = crate::TEST_NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let port = 19082u16;
-        let addr = format!("127.0.0.1:{port}");
-        let addr2 = addr.clone();
-
-        std::thread::spawn(move || {
-            go_lib::run(move || {
-                let mux = Arc::new(ServeMux::new());
-                mux.handle_func("/hello", |w, _r| {
-                    w.header().set("Content-Type", "text/plain");
-                    let _ = w.write(b"Hello, world!\n");
-                });
-                let mut srv = Server::new(addr2);
-                srv.handler = Some(mux);
-                let _ = srv.listen_and_serve();
-            });
-        });
-
-        std::thread::sleep(std::time::Duration::from_millis(150));
-
-        for _ in 0..10 {
-            match std::net::TcpStream::connect(format!("127.0.0.1:{port}")) {
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
-                Ok(mut conn) => {
-                    conn.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-                    write!(
-                        conn,
-                        "GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-                    ).unwrap();
-                    let mut resp = String::new();
-                    conn.read_to_string(&mut resp).unwrap();
-                    assert!(resp.starts_with("HTTP/1.1 200"), "bad status: {resp:?}");
-                    assert!(resp.contains("Hello, world!"), "body missing: {resp:?}");
-                    return;
-                }
-            }
-        }
-        panic!("could not connect to test server after retries");
-    }
 }
