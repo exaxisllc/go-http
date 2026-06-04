@@ -135,19 +135,30 @@ impl RoundTripper for Transport {
             let mut stream = stream;
             send_request(&mut stream, &mut req)?;
 
-            let parsed = read_response(
+            let mut parsed = read_response(
                 stream.try_clone().map_err(HttpError::Io)?,
                 Some(req.method.as_str()),
                 crate::parse::request::DEFAULT_MAX_HEADER_BYTES,
             )?;
 
             let keep_alive = is_keep_alive_parsed(&parsed, req.proto_minor);
-            let resp = parsed_response_to_response(parsed);
 
+            // Buffer the body into memory before releasing the stream to the
+            // pool.  The body is backed by a try_clone() of `stream`; if we
+            // release `stream` first and the caller drops the Response without
+            // reading the body, Body::drain() would race against the next
+            // request's reads on the same underlying socket (clone and
+            // original share one kernel file description) → SIGSEGV on
+            // Linux/epoll.  Buffering here fully drains the socket before the
+            // connection is reused, and replaces the network-backed body with
+            // an in-memory Cursor the caller can read freely.
             if keep_alive {
+                let bytes = parsed.body.read_to_vec().map_err(|_| HttpError::BodyRead)?;
+                parsed.body = Body::Unbounded(Box::new(io::Cursor::new(bytes)));
                 self.release(&host_port, stream);
             }
-            Ok(resp)
+
+            Ok(parsed_response_to_response(parsed))
         }
     }
 }

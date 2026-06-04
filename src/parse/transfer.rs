@@ -38,28 +38,17 @@ impl Read for Body {
 }
 
 impl Body {
-    /// Drain the entire body without returning the data.
-    /// Used by the HTTP client to ensure the connection is in a clean state
-    /// before reusing it for the next request.
-    pub fn drain(&mut self) -> io::Result<()> {
-        let mut buf = [0u8; 8192];
-        loop {
-            match self.read(&mut buf) {
-                Ok(0) => return Ok(()),
-                Ok(_) => {},
-                Err(e) => return Err(e),
-            }
-        }
-    }
-}
-
-impl Drop for Body {
-    fn drop(&mut self) {
-        // Drain any unread body data to ensure the connection is in a clean state.
-        // This is important for keep-alive connections where the client might not
-        // consume the response body before making the next request.
-        // If the body was already fully read, this is a no-op.
-        let _ = self.drain();
+    /// Read the entire body into a `Vec<u8>`.
+    ///
+    /// Used by the HTTP client to buffer the response body before releasing
+    /// the underlying `TcpStream` back to the connection pool.  Buffering
+    /// first ensures the stream is fully drained and that no `try_clone()`
+    /// alias of the stream is live when the next request starts, which would
+    /// cause concurrent reads on the same socket and SIGSEGV on Linux/epoll.
+    pub fn read_to_vec(&mut self) -> io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.read_to_end(&mut buf)?;
+        Ok(buf)
     }
 }
 
