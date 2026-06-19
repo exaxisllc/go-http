@@ -53,18 +53,55 @@ jobs:
       - name: cargo doc (no deps, no-run)
         run: cargo doc --no-deps
         
-      - name: cargo run --examples
+      - name: Smoke-test examples
         timeout-minutes: 10
-        # bash on all three platforms so the inverted exit-code check below
-        # behaves identically (the default Windows shell is pwsh).
+        # bash on all three platforms so the background/kill smoke-test below
+        # behaves identically (the default Windows shell is pwsh).  `timeout(1)`
+        # is not available on the macOS runners, so liveness is checked with a
+        # plain bash background job + `kill -0` rather than `timeout`.
         shell: bash
         run: |
-          cargo run --release --example client_get
-          cargo run --release --example echo_server
-          cargo run --release --example hello_server
-          cargo run --release --example middleware
-          cargo run --release --example routing
-          cargo run --release --example static_files
+          set -euo pipefail
+          # Pre-build so `cargo run` below starts each binary immediately,
+          # without compilation eating into the liveness window.
+          cargo build --release --examples
+
+          # Exercise the HTTP client end-to-end against a *local* server, so the
+          # check is hermetic — no external host and no hostname/DNS dependency
+          # (client_get's example.com default would otherwise add network flake;
+          # numeric 127.0.0.1 also avoids the resolver entirely).
+          cargo run --release --example hello_server &
+          hs=$!
+          sleep 5
+          set +e
+          cargo run --release --example client_get -- http://127.0.0.1:8080/hello
+          rc=$?
+          set -e
+          kill "$hs" 2>/dev/null || true
+          wait "$hs" 2>/dev/null || true
+          if [ "$rc" -ne 0 ]; then
+            echo "ERROR: client_get against local server failed (exit $rc)"
+            exit 1
+          fi
+
+          # The server examples block forever in listen_and_serve().  Start
+          # each one, confirm it is still alive after a few seconds (i.e. it
+          # bound its port and is serving rather than crashing on startup),
+          # then terminate it.  An early exit means a startup failure.
+          for ex in echo_server hello_server middleware routing static_files; do
+            echo "=== smoke-testing $ex ==="
+            cargo run --release --example "$ex" &
+            pid=$!
+            sleep 5
+            if kill -0 "$pid" 2>/dev/null; then
+              echo "$ex started OK"
+              kill "$pid" 2>/dev/null || true
+              wait "$pid" 2>/dev/null || true
+            else
+              echo "ERROR: $ex exited before the smoke-test window elapsed"
+              exit 1
+            fi
+          done
           
   build:
     name: Build
@@ -106,10 +143,16 @@ jobs:
       - name: Install coverage tool
         run: cargo +stable install cargo-llvm-cov --locked
       - name: Test project and generate coverage report
-        # go-lib 0.6.0's singleton scheduler makes concurrent `#[go_lib::main]`
+        # go-lib 0.6.x's singleton scheduler makes concurrent `#[go_lib::main]`
         # entries safe within one process, so plain `cargo llvm-cov` (no
         # per-test subprocess isolation via nextest) covers all tests.
-        run: cargo llvm-cov --remap-path-prefix --show-missing-lines --branch --lcov --output-path lcov.info
+        #
+        # --release is required: on Linux a *debug* goroutine stack is 16 KiB,
+        # and llvm-cov's coverage instrumentation inflates frames enough to
+        # overflow it (go-lib has no `morestack` growth), crashing the
+        # integration tests with a SIGSEGV.  Release builds use 32 KiB stacks
+        # with smaller frames, which clears the overflow.
+        run: cargo llvm-cov --release --remap-path-prefix --show-missing-lines --branch --lcov --output-path lcov.info
       - name: Publish coverage summary to job summary
         uses: livewing/lcov-job-summary@v1.1.0
         with:

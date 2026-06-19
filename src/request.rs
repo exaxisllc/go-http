@@ -256,4 +256,100 @@ mod tests {
         assert!(s.contains("Host: example.com\r\n"));
         assert!(s.contains("Accept: text/html\r\n"));
     }
+
+    #[test]
+    fn write_header_includes_query() {
+        let req = Request::new("GET", "http://example.com/search?q=rust&n=1", None).unwrap();
+        let mut out = Vec::new();
+        req.write_header_to(&mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("GET /search?q=rust&n=1 HTTP/1.1\r\n"), "got: {s:?}");
+    }
+
+    #[test]
+    fn body_sets_content_length_unknown() {
+        let body = Body::Unbounded(Box::new(std::io::Cursor::new(b"abc".to_vec())));
+        let req = Request::new("POST", "http://example.com/", Some(body)).unwrap();
+        assert_eq!(req.content_length, -1);
+        let none = Request::new("GET", "http://example.com/", None).unwrap();
+        assert_eq!(none.content_length, 0);
+    }
+
+    #[test]
+    fn parse_form_query_only() {
+        let mut req = Request::new("GET", "http://x/p?a=1&a=2&b=hello", None).unwrap();
+        req.parse_form().unwrap();
+        assert_eq!(req.form_value("a"), Some("1"));
+        assert_eq!(req.form_value("b"), Some("hello"));
+        assert_eq!(req.form_value("missing"), None);
+        // Idempotent: a second call is a no-op.
+        req.parse_form().unwrap();
+        assert_eq!(req.form_value("a"), Some("1"));
+    }
+
+    #[test]
+    fn parse_form_urlencoded_body() {
+        let body = Body::Unbounded(Box::new(std::io::Cursor::new(
+            b"name=Alice&city=New+York".to_vec(),
+        )));
+        let mut req = Request::new("POST", "http://x/submit?q=top", Some(body)).unwrap();
+        req.header.set("Content-Type", "application/x-www-form-urlencoded");
+        req.parse_form().unwrap();
+        // Query and body values are merged.
+        assert_eq!(req.form_value("q"), Some("top"));
+        assert_eq!(req.form_value("name"), Some("Alice"));
+        assert_eq!(req.form_value("city"), Some("New York"));
+    }
+
+    #[test]
+    fn basic_auth_valid() {
+        use base64::Engine;
+        let creds = base64::engine::general_purpose::STANDARD.encode("alice:s3cret");
+        let mut req = Request::new("GET", "http://x/", None).unwrap();
+        req.header.set("Authorization", format!("Basic {creds}"));
+        let (user, pass) = req.basic_auth().unwrap();
+        assert_eq!(user, "alice");
+        assert_eq!(pass, "s3cret");
+    }
+
+    #[test]
+    fn basic_auth_absent_or_wrong_scheme() {
+        let req = Request::new("GET", "http://x/", None).unwrap();
+        assert!(req.basic_auth().is_none());
+
+        let mut bearer = Request::new("GET", "http://x/", None).unwrap();
+        bearer.header.set("Authorization", "Bearer token123");
+        assert!(bearer.basic_auth().is_none());
+    }
+
+    #[test]
+    fn user_agent_and_referer() {
+        let mut req = Request::new("GET", "http://x/", None).unwrap();
+        assert_eq!(req.user_agent(), "");
+        assert_eq!(req.referer(), "");
+        req.header.set("User-Agent", "go-http/0.1");
+        req.header.set("Referer", "http://ref/");
+        assert_eq!(req.user_agent(), "go-http/0.1");
+        assert_eq!(req.referer(), "http://ref/");
+    }
+
+    #[test]
+    fn cookies_parsed_from_header() {
+        let mut req = Request::new("GET", "http://x/", None).unwrap();
+        req.header.set("Cookie", "session=abc; theme=dark");
+        let all = req.cookies();
+        assert_eq!(all.len(), 2);
+        assert_eq!(req.cookie("session").unwrap().value, "abc");
+        assert_eq!(req.cookie("theme").unwrap().value, "dark");
+        assert!(req.cookie("nope").is_none());
+    }
+
+    #[test]
+    fn with_context_replaces_context() {
+        let req = Request::new("GET", "http://x/", None).unwrap();
+        let ctx = go_lib::context::background();
+        let req = req.with_context(ctx);
+        // The context accessor returns the replacement without panicking.
+        let _ = req.context();
+    }
 }
