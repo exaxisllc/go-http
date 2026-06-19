@@ -6,8 +6,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-go-lib = "0.6.1"
-go-lib-macros = "0.6.0"
+go-lib = "0.6.2"
+go-lib-macros = "0.6.2"
 url = "2"
 base64 = "0.22"
 rustls = { version = "0.23", features = ["ring"] }

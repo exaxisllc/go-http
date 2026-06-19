@@ -54,3 +54,48 @@ impl From<ParseError> for HttpError {
         Self::Parse(e)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn display_for_each_variant() {
+        let io_err = HttpError::Io(io::Error::other("boom"));
+        assert!(io_err.to_string().contains("io error"));
+        assert!(io_err.to_string().contains("boom"));
+
+        let parse = HttpError::Parse(ParseError::BadRequestLine);
+        assert!(parse.to_string().contains("parse error"));
+
+        assert!(HttpError::InvalidUrl("bad".into()).to_string().contains("invalid URL: bad"));
+        assert_eq!(HttpError::Timeout.to_string(), "request timed out");
+        assert_eq!(HttpError::TooManyRedirects.to_string(), "too many redirects");
+        assert_eq!(HttpError::BodyRead.to_string(), "error reading body");
+        assert!(HttpError::Mime("m".into()).to_string().contains("mime error: m"));
+        assert!(HttpError::Tls("t".into()).to_string().contains("TLS error: t"));
+    }
+
+    #[test]
+    fn source_is_set_for_wrapped_errors() {
+        let io_err = HttpError::Io(io::Error::other("x"));
+        assert!(io_err.source().is_some());
+
+        let parse = HttpError::Parse(ParseError::UnexpectedEof);
+        assert!(parse.source().is_some());
+
+        // Variants without an inner cause return None.
+        assert!(HttpError::Timeout.source().is_none());
+        assert!(HttpError::BodyRead.source().is_none());
+    }
+
+    #[test]
+    fn from_conversions() {
+        let from_io: HttpError = io::Error::new(io::ErrorKind::NotFound, "nf").into();
+        assert!(matches!(from_io, HttpError::Io(_)));
+
+        let from_parse: HttpError = ParseError::BadStatusLine.into();
+        assert!(matches!(from_parse, HttpError::Parse(_)));
+    }
+}

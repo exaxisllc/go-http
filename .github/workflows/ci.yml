@@ -129,10 +129,16 @@ jobs:
       - name: Install coverage tool
         run: cargo +stable install cargo-llvm-cov --locked
       - name: Test project and generate coverage report
-        # go-lib 0.6.0's singleton scheduler makes concurrent `#[go_lib::main]`
+        # go-lib 0.6.x's singleton scheduler makes concurrent `#[go_lib::main]`
         # entries safe within one process, so plain `cargo llvm-cov` (no
         # per-test subprocess isolation via nextest) covers all tests.
-        run: cargo llvm-cov --remap-path-prefix --show-missing-lines --branch --lcov --output-path lcov.info
+        #
+        # --release is required: on Linux a *debug* goroutine stack is 16 KiB,
+        # and llvm-cov's coverage instrumentation inflates frames enough to
+        # overflow it (go-lib has no `morestack` growth), crashing the
+        # integration tests with a SIGSEGV.  Release builds use 32 KiB stacks
+        # with smaller frames, which clears the overflow.
+        run: cargo llvm-cov --release --remap-path-prefix --show-missing-lines --branch --lcov --output-path lcov.info
       - name: Publish coverage summary to job summary
         uses: livewing/lcov-job-summary@v1.1.0
         with:

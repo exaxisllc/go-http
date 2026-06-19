@@ -133,9 +133,9 @@ dependencies = [
 
 [[package]]
 name = "go-lib"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8bcf79a34727f1e8f6dbdc903bd54bd216eb1bcf2bef7e0744e57b4aac63af9"
+checksum = "a69a31442d9252249fe83568bcc9875603578b3e6847933158baa78aebec61a6"
 dependencies = [
  "go-lib-macros",
  "libc",
@@ -143,9 +143,9 @@ dependencies = [
 
 [[package]]
 name = "go-lib-macros"
-version = "0.6.0"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e44b38742f988ccb6652c29cd427dc53d9e402a05098f70f4c7c15ec027710ec"
+checksum = "9746a0fc37e194904f1b35c678ddeac9cda3ced3e5ccc185a0ca792e1171fafe"
 dependencies = [
  "proc-macro2",
  "quote",

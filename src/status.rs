@@ -157,5 +157,80 @@ mod tests {
     #[test]
     fn unknown_code() {
         assert_eq!(status_text(999), "");
+        assert_eq!(status_text(0), "");
+        assert_eq!(status_text(600), "");
+    }
+
+    #[test]
+    fn every_known_code_has_text() {
+        // Exercise every arm of status_text and confirm the constants map to
+        // their canonical reason phrases.
+        let cases: &[(u16, &str)] = &[
+            (CONTINUE, "Continue"),
+            (SWITCHING_PROTOCOLS, "Switching Protocols"),
+            (PROCESSING, "Processing"),
+            (EARLY_HINTS, "Early Hints"),
+            (OK, "OK"),
+            (CREATED, "Created"),
+            (ACCEPTED, "Accepted"),
+            (NON_AUTHORITATIVE_INFO, "Non-Authoritative Information"),
+            (NO_CONTENT, "No Content"),
+            (RESET_CONTENT, "Reset Content"),
+            (PARTIAL_CONTENT, "Partial Content"),
+            (MULTI_STATUS, "Multi-Status"),
+            (ALREADY_REPORTED, "Already Reported"),
+            (IM_USED, "IM Used"),
+            (MULTIPLE_CHOICES, "Multiple Choices"),
+            (MOVED_PERMANENTLY, "Moved Permanently"),
+            (FOUND, "Found"),
+            (SEE_OTHER, "See Other"),
+            (NOT_MODIFIED, "Not Modified"),
+            (USE_PROXY, "Use Proxy"),
+            (TEMPORARY_REDIRECT, "Temporary Redirect"),
+            (PERMANENT_REDIRECT, "Permanent Redirect"),
+            (BAD_REQUEST, "Bad Request"),
+            (UNAUTHORIZED, "Unauthorized"),
+            (PAYMENT_REQUIRED, "Payment Required"),
+            (FORBIDDEN, "Forbidden"),
+            (NOT_FOUND, "Not Found"),
+            (METHOD_NOT_ALLOWED, "Method Not Allowed"),
+            (NOT_ACCEPTABLE, "Not Acceptable"),
+            (PROXY_AUTH_REQUIRED, "Proxy Authentication Required"),
+            (REQUEST_TIMEOUT, "Request Timeout"),
+            (CONFLICT, "Conflict"),
+            (GONE, "Gone"),
+            (LENGTH_REQUIRED, "Length Required"),
+            (PRECONDITION_FAILED, "Precondition Failed"),
+            (REQUEST_ENTITY_TOO_LARGE, "Request Entity Too Large"),
+            (REQUEST_URI_TOO_LONG, "Request-URI Too Long"),
+            (UNSUPPORTED_MEDIA_TYPE, "Unsupported Media Type"),
+            (REQUESTED_RANGE_NOT_SATISFIABLE, "Requested Range Not Satisfiable"),
+            (EXPECTATION_FAILED, "Expectation Failed"),
+            (TEAPOT, "I'm a teapot"),
+            (MISDIRECTED_REQUEST, "Misdirected Request"),
+            (UNPROCESSABLE_ENTITY, "Unprocessable Entity"),
+            (LOCKED, "Locked"),
+            (FAILED_DEPENDENCY, "Failed Dependency"),
+            (TOO_EARLY, "Too Early"),
+            (UPGRADE_REQUIRED, "Upgrade Required"),
+            (PRECONDITION_REQUIRED, "Precondition Required"),
+            (TOO_MANY_REQUESTS, "Too Many Requests"),
+            (REQUEST_HEADER_FIELDS_TOO_LARGE, "Request Header Fields Too Large"),
+            (UNAVAILABLE_FOR_LEGAL_REASONS, "Unavailable For Legal Reasons"),
+            (INTERNAL_SERVER_ERROR, "Internal Server Error"),
+            (NOT_IMPLEMENTED, "Not Implemented"),
+            (BAD_GATEWAY, "Bad Gateway"),
+            (SERVICE_UNAVAILABLE, "Service Unavailable"),
+            (GATEWAY_TIMEOUT, "Gateway Timeout"),
+            (HTTP_VERSION_NOT_SUPPORTED, "HTTP Version Not Supported"),
+            (VARIANT_ALSO_NEGOTIATES, "Variant Also Negotiates"),
+            (INSUFFICIENT_STORAGE, "Insufficient Storage"),
+            (LOOP_DETECTED, "Loop Detected"),
+            (NOT_EXTENDED, "Not Extended"),
+            (NETWORK_AUTHENTICATION_REQUIRED, "Network Authentication Required"),
+        ];
+        for (code, text) in cases {
+            assert_eq!(status_text(*code), *text, "wrong text for {code}");
+        }
     }
 }

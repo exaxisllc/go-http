@@ -203,4 +203,59 @@ mod tests {
         // Just check no data is lost (lengths comparable).
         assert!(!decoded.is_empty());
     }
+
+    #[test]
+    fn encode_special_and_highbit_bytes() {
+        let mut enc = Vec::new();
+        {
+            let mut w = QpWriter::new(&mut enc);
+            // '=' must be escaped; 0xFF is high-bit; \t is literal; \n → CRLF.
+            w.write_all(b"a=b\tc\n").unwrap();
+            w.write_all(&[0xFF]).unwrap();
+            w.finish().unwrap();
+        }
+        let s = String::from_utf8(enc).unwrap();
+        assert!(s.contains("=3D"), "'=' should be escaped: {s:?}");
+        assert!(s.contains("=FF"), "high-bit byte should be escaped: {s:?}");
+        assert!(s.contains('\t'), "tab should pass through literally: {s:?}");
+        // '\n' is a control byte, so the encoder escapes it as =0A.
+        assert!(s.contains("=0A"), "newline should be QP-escaped: {s:?}");
+    }
+
+    #[test]
+    fn encode_inserts_soft_line_breaks_past_76_cols() {
+        let mut enc = Vec::new();
+        {
+            let mut w = QpWriter::new(&mut enc);
+            w.write_all(&[b'x'; 200]).unwrap();
+            w.finish().unwrap();
+        }
+        let s = String::from_utf8(enc).unwrap();
+        assert!(s.contains("=\r\n"), "long line should be soft-wrapped: {s:?}");
+        // Each wrapped segment carries up to 76 data chars plus the trailing
+        // soft-break '='.
+        for line in s.split("\r\n") {
+            assert!(line.len() <= 77, "line too long: {:?}", line);
+        }
+    }
+
+    #[test]
+    fn decode_crlf_normalised_to_lf() {
+        let mut r = QpReader::new(Cursor::new(b"line1\r\nline2"));
+        let mut s = String::new();
+        r.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "line1\nline2");
+    }
+
+    #[test]
+    fn decode_errors() {
+        for bad in [b"abc=".as_ref(), b"abc=X".as_ref(), b"=ZZ".as_ref()] {
+            let mut r = QpReader::new(Cursor::new(bad));
+            let mut out = Vec::new();
+            assert!(
+                r.read_to_end(&mut out).is_err(),
+                "expected decode error for {bad:?}",
+            );
+        }
+    }
 }
