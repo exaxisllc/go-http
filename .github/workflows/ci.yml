@@ -41,43 +41,31 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-
-      - name: cargo test (unit tests)
-        # Run the lib unit tests with plain cargo test — they have no go_lib::run()
-        # calls and finish in under 1 second.
-        timeout-minutes: 5
-        run: cargo test --lib -- --nocapture
-
-      - name: cargo nextest run (integration tests)
-        # nextest runs each integration test in its own subprocess.
-        # This is required because go_lib's goroutine scheduler is a
-        # process-global singleton: background goroutines spawned by one test
-        # (e.g. the HTTP server goroutine in listen_and_serve) keep running
-        # after go_lib::run() returns, and on Linux/epoll their stale state
-        # corrupts the next test's scheduler → SIGSEGV.  Running each test
-        # in its own OS process gives each test a clean scheduler instance.
+      - name: cargo test
+        # go-lib 0.6.0's scheduler is a process-wide singleton: concurrent
+        # `#[go_lib::main]` entries share one scheduler and tag netpoll
+        # registrations per invocation, so the integration tests run safely
+        # in a single process alongside the unit tests — no per-test process
+        # isolation (cargo-nextest) is needed anymore.
         timeout-minutes: 10
-        run: cargo nextest run --test middleware --test server_client
-
-      - name: Print Windows VEH crash file (if present)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        # The VEH writes .\go-lib-crash-veh.txt on crash.  Print it so the
-        # diagnostics appear in the CI log even when the test binary exits via
-        # TerminateProcess (which may race with pipe drain).
-        run: |
-          if (Test-Path "go-lib-crash-veh.txt") {
-            Write-Host "=== go-lib-crash-veh.txt ==="
-            Get-Content "go-lib-crash-veh.txt"
-          } else {
-            Write-Host "(no crash file — process either did not crash or VEH was not reached)"
-          }
+        run: cargo test --release -- --nocapture
 
       - name: cargo doc (no deps, no-run)
         run: cargo doc --no-deps
         
+      - name: cargo run --examples
+        timeout-minutes: 10
+        # bash on all three platforms so the inverted exit-code check below
+        # behaves identically (the default Windows shell is pwsh).
+        shell: bash
+        run: |
+          cargo run --release --example client_get
+          cargo run --release --example echo_server
+          cargo run --release --example hello_server
+          cargo run --release --example middleware
+          cargo run --release --example routing
+          cargo run --release --example static_files
+          
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -117,14 +105,11 @@ jobs:
           rustup component add llvm-tools-preview --toolchain ${{ matrix.toolchain }}
       - name: Install coverage tool
         run: cargo +stable install cargo-llvm-cov --locked
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
       - name: Test project and generate coverage report
-        # Use `cargo llvm-cov nextest` so that each test runs in its own
-        # subprocess — required because go_lib's goroutine scheduler is a
-        # process-global singleton that causes SIGSEGV on Linux/epoll when
-        # multiple integration tests share a process.
-        run: cargo llvm-cov nextest --remap-path-prefix --show-missing-lines --branch --lcov --output-path lcov.info
+        # go-lib 0.6.0's singleton scheduler makes concurrent `#[go_lib::main]`
+        # entries safe within one process, so plain `cargo llvm-cov` (no
+        # per-test subprocess isolation via nextest) covers all tests.
+        run: cargo llvm-cov --remap-path-prefix --show-missing-lines --branch --lcov --output-path lcov.info
       - name: Publish coverage summary to job summary
         uses: livewing/lcov-job-summary@v1.1.0
         with:

@@ -561,7 +561,7 @@ mod tests {
     }
 
     // timeout_handler is covered by tests/middleware.rs integration tests
-    // (timeout_handler_fast_passes, timeout_handler_slow_503) which run in
-    // their own process — go_lib::run() is not safe to call multiple times
-    // in the same process (netpoll singleton), so these tests live there.
+    // (timeout_handler_fast_passes, timeout_handler_slow_503), which carry
+    // `#[go_lib::main]` so each test body runs as the first goroutine on the
+    // shared process-wide scheduler.
 }

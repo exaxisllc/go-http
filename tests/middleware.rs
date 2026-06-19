@@ -2,8 +2,9 @@
 //! Integration tests for handler middleware: strip_prefix, file_server,
 //! timeout_handler, and custom middleware composition.
 //!
-//! Same single-scheduler design as server_client.rs: server goroutine and
-//! client goroutine live in the same go_lib::run() call.
+//! Same single-scheduler design as server_client.rs: each test carries
+//! `#[go_lib::main]`, so the test body runs as the first goroutine and the
+//! server goroutine lives alongside the client on the process-wide scheduler.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,9 +19,6 @@ use go_http::{
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-// Same serialisation rationale as server_client.rs.
-static NET_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 static PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(19300);
 fn next_port() -> u16 {
@@ -41,25 +39,23 @@ fn start_server_goroutine(addr: String, handler: Arc<dyn Handler>) {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn strip_prefix_integration() {
-    let _g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let port = next_port();
     let addr = format!("127.0.0.1:{port}");
 
-    go_lib::run(move || {
-        let inner = handler_func(|w, r| {
-            let _ = w.write(r.url.path().as_bytes());
-        });
-        let h: Arc<dyn Handler> = Arc::new(strip_prefix("/api/v1".to_owned(), inner));
-        start_server_goroutine(addr, h);
-
-        let mut resp = Client::new()
-            .get(&format!("http://127.0.0.1:{port}/api/v1/users"))
-            .expect("GET failed");
-        assert_eq!(resp.status, status::OK);
-        let body = resp.body_string().unwrap();
-        assert_eq!(body, "/users", "inner handler should see /users, got: {body:?}");
+    let inner = handler_func(|w, r| {
+        let _ = w.write(r.url.path().as_bytes());
     });
+    let h: Arc<dyn Handler> = Arc::new(strip_prefix("/api/v1".to_owned(), inner));
+    start_server_goroutine(addr, h);
+
+    let mut resp = Client::new()
+        .get(&format!("http://127.0.0.1:{port}/api/v1/users"))
+        .expect("GET failed");
+    assert_eq!(resp.status, status::OK);
+    let body = resp.body_string().unwrap();
+    assert_eq!(body, "/users", "inner handler should see /users, got: {body:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -67,21 +63,19 @@ fn strip_prefix_integration() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn strip_prefix_no_match_404() {
-    let _g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let port = next_port();
     let addr = format!("127.0.0.1:{port}");
 
-    go_lib::run(move || {
-        let inner = handler_func(|w, _| { let _ = w.write(b"ok"); });
-        let h: Arc<dyn Handler> = Arc::new(strip_prefix("/api".to_owned(), inner));
-        start_server_goroutine(addr, h);
+    let inner = handler_func(|w, _| { let _ = w.write(b"ok"); });
+    let h: Arc<dyn Handler> = Arc::new(strip_prefix("/api".to_owned(), inner));
+    start_server_goroutine(addr, h);
 
-        let resp = Client::new()
-            .get(&format!("http://127.0.0.1:{port}/other/path"))
-            .expect("GET failed");
-        assert_eq!(resp.status, status::NOT_FOUND);
-    });
+    let resp = Client::new()
+        .get(&format!("http://127.0.0.1:{port}/other/path"))
+        .expect("GET failed");
+    assert_eq!(resp.status, status::NOT_FOUND);
 }
 
 // ---------------------------------------------------------------------------
@@ -89,8 +83,8 @@ fn strip_prefix_no_match_404() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn file_server_serves_file() {
-    let _g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir()
         .join(format!("go_http_fs_test_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -100,16 +94,14 @@ fn file_server_serves_file() {
     let addr = format!("127.0.0.1:{port}");
     let dir_str = dir.to_str().unwrap().to_owned();
 
-    go_lib::run(move || {
-        let h: Arc<dyn Handler> = Arc::new(file_server(dir_str));
-        start_server_goroutine(addr, h);
+    let h: Arc<dyn Handler> = Arc::new(file_server(dir_str));
+    start_server_goroutine(addr, h);
 
-        let mut resp = Client::new()
-            .get(&format!("http://127.0.0.1:{port}/hello.txt"))
-            .expect("GET failed");
-        assert_eq!(resp.status, status::OK);
-        assert_eq!(resp.body_string().unwrap(), "file contents here");
-    });
+    let mut resp = Client::new()
+        .get(&format!("http://127.0.0.1:{port}/hello.txt"))
+        .expect("GET failed");
+    assert_eq!(resp.status, status::OK);
+    assert_eq!(resp.body_string().unwrap(), "file contents here");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -119,8 +111,8 @@ fn file_server_serves_file() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn file_server_missing_404() {
-    let _g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir()
         .join(format!("go_http_fs2_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -129,15 +121,13 @@ fn file_server_missing_404() {
     let addr = format!("127.0.0.1:{port}");
     let dir_str = dir.to_str().unwrap().to_owned();
 
-    go_lib::run(move || {
-        let h: Arc<dyn Handler> = Arc::new(file_server(dir_str));
-        start_server_goroutine(addr, h);
+    let h: Arc<dyn Handler> = Arc::new(file_server(dir_str));
+    start_server_goroutine(addr, h);
 
-        let resp = Client::new()
-            .get(&format!("http://127.0.0.1:{port}/does_not_exist.txt"))
-            .expect("GET failed");
-        assert_eq!(resp.status, status::NOT_FOUND);
-    });
+    let resp = Client::new()
+        .get(&format!("http://127.0.0.1:{port}/does_not_exist.txt"))
+        .expect("GET failed");
+    assert_eq!(resp.status, status::NOT_FOUND);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -147,8 +137,8 @@ fn file_server_missing_404() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn file_server_with_strip_prefix() {
-    let _g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir()
         .join(format!("go_http_fs3_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -158,17 +148,15 @@ fn file_server_with_strip_prefix() {
     let addr = format!("127.0.0.1:{port}");
     let dir_str = dir.to_str().unwrap().to_owned();
 
-    go_lib::run(move || {
-        let fs = file_server(dir_str);
-        let h: Arc<dyn Handler> = Arc::new(strip_prefix("/static".to_owned(), fs));
-        start_server_goroutine(addr, h);
+    let fs = file_server(dir_str);
+    let h: Arc<dyn Handler> = Arc::new(strip_prefix("/static".to_owned(), fs));
+    start_server_goroutine(addr, h);
 
-        let mut resp = Client::new()
-            .get(&format!("http://127.0.0.1:{port}/static/style.css"))
-            .expect("GET failed");
-        assert_eq!(resp.status, status::OK);
-        assert_eq!(resp.body_string().unwrap(), "body { color: red; }");
-    });
+    let mut resp = Client::new()
+        .get(&format!("http://127.0.0.1:{port}/static/style.css"))
+        .expect("GET failed");
+    assert_eq!(resp.status, status::OK);
+    assert_eq!(resp.body_string().unwrap(), "body { color: red; }");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -178,22 +166,20 @@ fn file_server_with_strip_prefix() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn timeout_handler_fast_passes() {
-    let _g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let port = next_port();
     let addr = format!("127.0.0.1:{port}");
 
-    go_lib::run(move || {
-        let inner = handler_func(|w, _| { let _ = w.write(b"fast response"); });
-        let h: Arc<dyn Handler> = Arc::new(timeout_handler(inner, Duration::from_secs(5), "timeout"));
-        start_server_goroutine(addr, h);
+    let inner = handler_func(|w, _| { let _ = w.write(b"fast response"); });
+    let h: Arc<dyn Handler> = Arc::new(timeout_handler(inner, Duration::from_secs(5), "timeout"));
+    start_server_goroutine(addr, h);
 
-        let mut resp = Client::new()
-            .get(&format!("http://127.0.0.1:{port}/"))
-            .expect("GET failed");
-        assert_eq!(resp.status, status::OK);
-        assert_eq!(resp.body_string().unwrap(), "fast response");
-    });
+    let mut resp = Client::new()
+        .get(&format!("http://127.0.0.1:{port}/"))
+        .expect("GET failed");
+    assert_eq!(resp.status, status::OK);
+    assert_eq!(resp.body_string().unwrap(), "fast response");
 }
 
 // ---------------------------------------------------------------------------
@@ -201,29 +187,27 @@ fn timeout_handler_fast_passes() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn timeout_handler_slow_503() {
-    let _g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let port = next_port();
     let addr = format!("127.0.0.1:{port}");
 
-    go_lib::run(move || {
-        let inner = handler_func(|_w, _| {
-            go_lib::sleep(Duration::from_secs(10));
-        });
-        let h: Arc<dyn Handler> = Arc::new(timeout_handler(
-            inner,
-            Duration::from_millis(50),
-            "request timed out",
-        ));
-        start_server_goroutine(addr, h);
-
-        let mut resp = Client::new()
-            .get(&format!("http://127.0.0.1:{port}/"))
-            .expect("GET failed");
-        assert_eq!(resp.status, status::SERVICE_UNAVAILABLE);
-        let body = resp.body_string().unwrap();
-        assert!(body.contains("timed out"), "expected timeout body, got: {body:?}");
+    let inner = handler_func(|_w, _| {
+        go_lib::sleep(Duration::from_secs(10));
     });
+    let h: Arc<dyn Handler> = Arc::new(timeout_handler(
+        inner,
+        Duration::from_millis(50),
+        "request timed out",
+    ));
+    start_server_goroutine(addr, h);
+
+    let mut resp = Client::new()
+        .get(&format!("http://127.0.0.1:{port}/"))
+        .expect("GET failed");
+    assert_eq!(resp.status, status::SERVICE_UNAVAILABLE);
+    let body = resp.body_string().unwrap();
+    assert!(body.contains("timed out"), "expected timeout body, got: {body:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -247,26 +231,23 @@ impl Handler for LoggingHandler {
 }
 
 #[test]
+#[go_lib::main]
 fn custom_logging_middleware() {
-    let _g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let port = next_port();
     let addr = format!("127.0.0.1:{port}");
 
     let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let log2 = Arc::clone(&log);
 
-    go_lib::run(move || {
-        let inner = handler_func(|w, _| { let _ = w.write(b"ok"); });
-        let h: Arc<dyn Handler> = Arc::new(LoggingHandler {
-            log:   log2,
-            inner: Arc::new(inner),
-        });
-        start_server_goroutine(addr, h);
-
-        let client = Client::new();
-        let _ = client.get(&format!("http://127.0.0.1:{port}/foo"));
-        let _ = client.get(&format!("http://127.0.0.1:{port}/bar"));
+    let inner = handler_func(|w, _| { let _ = w.write(b"ok"); });
+    let h: Arc<dyn Handler> = Arc::new(LoggingHandler {
+        log:   Arc::clone(&log),
+        inner: Arc::new(inner),
     });
+    start_server_goroutine(addr, h);
+
+    let client = Client::new();
+    let _ = client.get(&format!("http://127.0.0.1:{port}/foo"));
+    let _ = client.get(&format!("http://127.0.0.1:{port}/bar"));
 
     let logged = log.lock().unwrap();
     assert!(logged.contains(&"/foo".to_owned()), "missing /foo in log: {logged:?}");

@@ -17,6 +17,7 @@ use go_http::{
     server::Server,
 };
 
+#[go_lib::main]
 fn main() {
     // Create a small example assets directory if it doesn't exist.
     let assets = Path::new("examples/assets");
@@ -32,29 +33,27 @@ fn main() {
         println!("Created examples/assets/ with sample files.");
     }
 
-    go_lib::run(|| {
-        let mux = Arc::new(ServeMux::new());
+    let mux = Arc::new(ServeMux::new());
 
-        // /static/* → serve from examples/assets/
-        let fs = file_server("examples/assets".to_owned());
-        mux.handle(
-            "/static/",
-            strip_prefix("/static".to_owned(), fs),
-        );
+    // /static/* → serve from examples/assets/
+    let fs = file_server("examples/assets".to_owned());
+    mux.handle(
+        "/static/",
+        strip_prefix("/static".to_owned(), fs),
+    );
 
-        // Root — redirect to /static/index.html
-        mux.handle_func("/", |w, r| {
-            go_http::util::redirect(w, r, "/static/index.html", 302);
-        });
-
-        println!("Static file server on http://127.0.0.1:8083");
-        println!("  http://127.0.0.1:8083/static/hello.txt");
-        println!("  http://127.0.0.1:8083/static/index.html");
-
-        let mut srv = Server::new("127.0.0.1:8083");
-        srv.handler = Some(mux);
-        if let Err(e) = srv.listen_and_serve() {
-            eprintln!("server error: {e}");
-        }
+    // Root — redirect to /static/index.html
+    mux.handle_func("/", |w, r| {
+        go_http::util::redirect(w, r, "/static/index.html", 302);
     });
+
+    println!("Static file server on http://127.0.0.1:8083");
+    println!("  http://127.0.0.1:8083/static/hello.txt");
+    println!("  http://127.0.0.1:8083/static/index.html");
+
+    let mut srv = Server::new("127.0.0.1:8083");
+    srv.handler = Some(mux);
+    if let Err(e) = srv.listen_and_serve() {
+        eprintln!("server error: {e}");
+    }
 }

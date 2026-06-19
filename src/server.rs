@@ -63,7 +63,7 @@ impl Server {
 
     /// Bind, listen, and serve HTTP/1.1 requests.
     ///
-    /// **Must be called from within `go_lib::run(...)`.**
+    /// **Must be called from within a `#[go_lib::main]` body (goroutine context).**
     ///
     /// Blocks the calling goroutine until `shutdown()` is called or a fatal
     /// listener error occurs.  Port of Go's `(*Server).ListenAndServe`.
@@ -128,7 +128,7 @@ impl Server {
     /// a TLS session using the certificate and key loaded from `cert_file` and
     /// `key_file` (PEM format).
     ///
-    /// **Must be called from within `go_lib::run(...)`.**
+    /// **Must be called from within a `#[go_lib::main]` body (goroutine context).**
     /// Port of Go's `(*Server).ListenAndServeTLS`.
     pub fn listen_and_serve_tls(
         &self,
@@ -404,7 +404,7 @@ fn build_request_scheme(
 
 /// Bind to `addr`, use `handler` (or `DefaultServeMux` if `None`), and serve.
 ///
-/// Must be called from within `go_lib::run(...)`.
+/// Must be called from within a `#[go_lib::main]` body (goroutine context).
 /// Port of Go's `http.ListenAndServe`.
 pub fn listen_and_serve(
     addr:    &str,
@@ -417,7 +417,7 @@ pub fn listen_and_serve(
 
 /// Bind to `addr`, load TLS credentials, and serve HTTPS.
 ///
-/// Must be called from within `go_lib::run(...)`.
+/// Must be called from within a `#[go_lib::main]` body (goroutine context).
 /// Port of Go's `http.ListenAndServeTLS`.
 pub fn listen_and_serve_tls(
     addr:      &str,

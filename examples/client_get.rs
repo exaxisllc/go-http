@@ -6,16 +6,15 @@
 
 use go_http::client::Client;
 
+#[go_lib::main]
 fn main() {
     let url = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "http://example.com/".to_owned());
 
-    let result = go_lib::run(move || {
-        let client = Client::new();
-        println!("GET {url}");
-        client.get(&url)
-    });
+    let client = Client::new();
+    println!("GET {url}");
+    let result = client.get(&url);
 
     match result {
         Err(e) => {

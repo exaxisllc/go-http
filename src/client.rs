@@ -588,7 +588,7 @@ mod tests {
     }
 
     // client_get_end_to_end is covered by tests/server_client.rs integration
-    // tests (get_basic, multiple_sequential_requests, etc.) which run in their
-    // own process — go_lib::run() is not safe to call multiple times in the
-    // same process (netpoll singleton), so these tests live there.
+    // tests (get_basic, multiple_sequential_requests, etc.), which carry
+    // `#[go_lib::main]` so each test body runs as the first goroutine on the
+    // shared process-wide scheduler.
 }
