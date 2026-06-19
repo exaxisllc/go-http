@@ -2,7 +2,7 @@
 
 [package]
 name = "go-http"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["berryware"]
 description = "rust native port of GO's http module"
@@ -11,7 +11,7 @@ keywords = ["http", "http-server", "http-client"]
 repository = "https://github.com/exaxisllc/go-lib"
 readme = "README.md"
 exclude = ["target"]
-categories = ["http"]
+categories = ["web-programming", "web-programming::http-client", "web-programming::http-server"]
 
 [dependencies]
 go-lib = "0.6.2"
