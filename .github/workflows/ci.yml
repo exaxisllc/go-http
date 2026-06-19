@@ -53,18 +53,41 @@ jobs:
       - name: cargo doc (no deps, no-run)
         run: cargo doc --no-deps
         
-      - name: cargo run --examples
+      - name: Smoke-test examples
         timeout-minutes: 10
-        # bash on all three platforms so the inverted exit-code check below
-        # behaves identically (the default Windows shell is pwsh).
+        # bash on all three platforms so the background/kill smoke-test below
+        # behaves identically (the default Windows shell is pwsh).  `timeout(1)`
+        # is not available on the macOS runners, so liveness is checked with a
+        # plain bash background job + `kill -0` rather than `timeout`.
         shell: bash
         run: |
+          set -euo pipefail
+          # Pre-build so `cargo run` below starts each binary immediately,
+          # without compilation eating into the liveness window.
+          cargo build --release --examples
+
+          # client_get runs to completion and must exit 0 (exercises the real
+          # DNS + HTTP client path — the go-lib 0.6.1 resolver-stack fix).
           cargo run --release --example client_get
-          cargo run --release --example echo_server
-          cargo run --release --example hello_server
-          cargo run --release --example middleware
-          cargo run --release --example routing
-          cargo run --release --example static_files
+
+          # The server examples block forever in listen_and_serve().  Start
+          # each one, confirm it is still alive after a few seconds (i.e. it
+          # bound its port and is serving rather than crashing on startup),
+          # then terminate it.  An early exit means a startup failure.
+          for ex in echo_server hello_server middleware routing static_files; do
+            echo "=== smoke-testing $ex ==="
+            cargo run --release --example "$ex" &
+            pid=$!
+            sleep 5
+            if kill -0 "$pid" 2>/dev/null; then
+              echo "$ex started OK"
+              kill "$pid" 2>/dev/null || true
+              wait "$pid" 2>/dev/null || true
+            else
+              echo "ERROR: $ex exited before the smoke-test window elapsed"
+              exit 1
+            fi
+          done
           
   build:
     name: Build

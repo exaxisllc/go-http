@@ -133,9 +133,9 @@ dependencies = [
 
 [[package]]
 name = "go-lib"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bafb66fc74dcff0946bed9abc4100a5510f5043a4adaee78a35bba9a9baa6317"
+checksum = "f8bcf79a34727f1e8f6dbdc903bd54bd216eb1bcf2bef7e0744e57b4aac63af9"
 dependencies = [
  "go-lib-macros",
  "libc",
