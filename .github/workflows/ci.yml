@@ -66,9 +66,23 @@ jobs:
           # without compilation eating into the liveness window.
           cargo build --release --examples
 
-          # client_get runs to completion and must exit 0 (exercises the real
-          # DNS + HTTP client path — the go-lib 0.6.1 resolver-stack fix).
-          cargo run --release --example client_get
+          # Exercise the HTTP client end-to-end against a *local* server, so the
+          # check is hermetic — no external host and no hostname/DNS dependency
+          # (client_get's example.com default would otherwise add network flake;
+          # numeric 127.0.0.1 also avoids the resolver entirely).
+          cargo run --release --example hello_server &
+          hs=$!
+          sleep 5
+          set +e
+          cargo run --release --example client_get -- http://127.0.0.1:8080/hello
+          rc=$?
+          set -e
+          kill "$hs" 2>/dev/null || true
+          wait "$hs" 2>/dev/null || true
+          if [ "$rc" -ne 0 ]; then
+            echo "ERROR: client_get against local server failed (exit $rc)"
+            exit 1
+          fi
 
           # The server examples block forever in listen_and_serve().  Start
           # each one, confirm it is still alive after a few seconds (i.e. it
