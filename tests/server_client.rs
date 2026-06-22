@@ -47,7 +47,7 @@ fn start_server_goroutine(addr: String, mux: Arc<ServeMux>) {
 }
 
 /// Spawn a configured Server (allows non-default settings like max_body_bytes).
-fn start_configured_server(addr: String, srv: Server) {
+fn start_configured_server(_addr: String, srv: Server) {
     go_lib::go!(move || {
         let _ = srv.listen_and_serve();
     });
@@ -576,4 +576,321 @@ fn chunked_trailers_roundtrip() {
         if line == "\r\n" { break; }
     }
     assert!(found_checksum, "X-Got-Checksum header not found in response");
+}
+
+// ---------------------------------------------------------------------------
+// 18. Graceful shutdown — waits for in-flight requests to complete
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn graceful_shutdown_waits() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::io::{BufRead, BufReader, Write};
+
+    let port = next_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    // Flag set by the handler to prove it ran to completion.
+    let handler_done = Arc::new(AtomicBool::new(false));
+    let handler_done2 = Arc::clone(&handler_done);
+
+    let mux = Arc::new(ServeMux::new());
+    mux.handle_func("/slow", move |w, _r| {
+        // Simulate a slow handler: sleep a bit, then mark completion.
+        go_lib::sleep(Duration::from_millis(80));
+        handler_done2.store(true, Ordering::Release);
+        w.header().set("Content-Type", "text/plain");
+        let _ = w.write(b"done");
+    });
+
+    let srv = Arc::new({
+        let mut s = Server::new(addr.clone());
+        s.handler = Some(mux);
+        s
+    });
+    let srv2 = Arc::clone(&srv);
+
+    go_lib::go!(move || { let _ = srv2.listen_and_serve(); });
+    go_lib::sleep(Duration::from_millis(30));
+
+    // Open a connection and fire the slow request.
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    write!(stream,
+        "GET /slow HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    ).expect("write");
+    stream.flush().expect("flush");
+
+    // Give the handler time to start but not finish, then shut down.
+    go_lib::sleep(Duration::from_millis(30));
+
+    // shutdown() must block until the handler finishes.
+    srv.shutdown();
+
+    // After shutdown() returns, the handler must have completed.
+    assert!(
+        handler_done.load(Ordering::Acquire),
+        "shutdown() returned before the slow handler finished"
+    );
+
+    // The response must also be readable (handler wrote "done").
+    let mut body = String::new();
+    BufReader::new(stream)
+        .lines()
+        .filter_map(Result::ok)
+        .for_each(|l| body.push_str(&l));
+    assert!(body.contains("done"), "expected 'done' in response, got: {body:?}");
+}
+
+// ---------------------------------------------------------------------------
+// 19. Idle timeout — closes keep-alive connection after inactivity
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn idle_timeout_closes_connection() {
+    use std::io::{BufRead, BufReader, Write, Read};
+
+    let port = next_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mux = Arc::new(ServeMux::new());
+    mux.handle_func("/ping", |w, _r| {
+        let _ = w.write(b"pong");
+    });
+
+    let mut srv = Server::new(addr.clone());
+    srv.handler      = Some(mux);
+    srv.idle_timeout = Some(Duration::from_millis(80));
+    start_configured_server(addr.clone(), srv);
+
+    // Send one complete request; verify it succeeds.
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+
+    write!(stream,
+        "GET /ping HTTP/1.1\r\nHost: {addr}\r\n\r\n"
+    ).expect("write request");
+    stream.flush().expect("flush");
+
+    let mut status = String::new();
+    reader.read_line(&mut status).expect("read status");
+    assert!(status.starts_with("HTTP/1.1 200"), "expected 200, got: {status:?}");
+
+    // Drain the response so the connection enters idle state.
+    let mut buf = [0u8; 4096];
+    let mut in_body = false;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 { break; }
+        if line == "\r\n" { in_body = true; }
+        if in_body {
+            // Read the chunked body (small, just "pong").
+            let n = reader.read(&mut buf).unwrap_or(0);
+            if n == 0 { break; }
+            // Check for terminal chunk.
+            if String::from_utf8_lossy(&buf[..n]).contains("0\r\n\r\n") { break; }
+        }
+    }
+
+    // Now wait longer than idle_timeout without sending another request.
+    go_lib::sleep(Duration::from_millis(160));
+
+    // The server should have shut down the read side; any further read returns 0.
+    let n = stream.try_clone()
+        .and_then(|mut s| s.read(&mut buf).map_err(|e| e.into()))
+        .unwrap_or(0);
+    assert_eq!(n, 0, "expected EOF after idle timeout, got {n} bytes");
+}
+
+// ---------------------------------------------------------------------------
+// 20. Method routing — GET /item and POST /item dispatch separately
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn method_routing_get_post() {
+    let port = next_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mux = Arc::new(ServeMux::new());
+    mux.handle_func("GET /item", |w, _r| {
+        w.header().set("X-Method", "GET");
+        let _ = w.write(b"got item");
+    });
+    mux.handle_func("POST /item", |w, _r| {
+        w.header().set("X-Method", "POST");
+        let _ = w.write(b"posted item");
+    });
+    start_server_goroutine(addr.clone(), mux);
+
+    // GET /item → 200 with X-Method: GET
+    let resp = Client::new()
+        .get(&format!("http://127.0.0.1:{port}/item"))
+        .expect("GET /item");
+    assert_eq!(resp.status, status::OK);
+    assert_eq!(resp.header.get("X-Method"), Some("GET"));
+
+    // POST /item → 200 with X-Method: POST
+    let body = Body::Unbounded(Box::new(std::io::Cursor::new(b"".to_vec())));
+    let resp = Client::new()
+        .post(&format!("http://127.0.0.1:{port}/item"), "text/plain", body)
+        .expect("POST /item");
+    assert_eq!(resp.status, status::OK);
+    assert_eq!(resp.header.get("X-Method"), Some("POST"));
+
+    // DELETE /item → 405 (no handler registered for DELETE)
+    let raw = raw_round_trip(
+        &addr,
+        b"DELETE /item HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    let resp_str = String::from_utf8_lossy(&raw);
+    assert!(
+        resp_str.starts_with("HTTP/1.1 405"),
+        "expected 405, got: {resp_str:.80}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 21. Wildcard routing — single-segment {id}
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn wildcard_single_segment() {
+    let port = next_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mux = Arc::new(ServeMux::new());
+    mux.handle_func("/items/{id}", |w, r| {
+        let id = r.path_value("id").to_owned();
+        w.header().set("X-Item-Id", &id);
+        let _ = w.write(format!("item={id}").as_bytes());
+    });
+    start_server_goroutine(addr, mux);
+
+    let resp = Client::new()
+        .get(&format!("http://127.0.0.1:{port}/items/42"))
+        .expect("GET /items/42");
+    assert_eq!(resp.status, status::OK);
+    assert_eq!(resp.header.get("X-Item-Id"), Some("42"), "wrong path param");
+
+    // Extra path component should not match (no trailing slash).
+    let resp2 = Client::new()
+        .get(&format!("http://127.0.0.1:{port}/items/42/extra"))
+        .expect("GET /items/42/extra");
+    assert_eq!(resp2.status, status::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// 22. Wildcard routing — tail {path...}
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn wildcard_tail() {
+    let port = next_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mux = Arc::new(ServeMux::new());
+    mux.handle_func("/files/{path...}", |w, r| {
+        let p = r.path_value("path").to_owned();
+        w.header().set("X-Path", &p);
+        let _ = w.write(b"ok");
+    });
+    start_server_goroutine(addr, mux);
+
+    let resp = Client::new()
+        .get(&format!("http://127.0.0.1:{port}/files/a/b/c"))
+        .expect("GET /files/a/b/c");
+    assert_eq!(resp.status, status::OK);
+    assert_eq!(
+        resp.header.get("X-Path"), Some("a/b/c"),
+        "tail wildcard not captured correctly"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 23. Host-based routing
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn host_pattern() {
+    let port = next_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mux = Arc::new(ServeMux::new());
+    // Host-specific handler.
+    mux.handle_func("special.local/", |w, _r| {
+        let _ = w.write(b"special host");
+    });
+    // Fallback for all other hosts.
+    mux.handle_func("/", |w, _r| {
+        let _ = w.write(b"default host");
+    });
+    start_server_goroutine(addr.clone(), mux);
+
+    // Request with Host: special.local → host-specific handler.
+    let special = raw_round_trip(
+        &addr,
+        b"GET / HTTP/1.1\r\nHost: special.local\r\nConnection: close\r\n\r\n",
+    );
+    let special_str = String::from_utf8_lossy(&special);
+    assert!(
+        special_str.contains("special host"),
+        "expected 'special host', got: {special_str:.120}"
+    );
+
+    // Request with a different Host → default handler.
+    let default = raw_round_trip(
+        &addr,
+        b"GET / HTTP/1.1\r\nHost: other.local\r\nConnection: close\r\n\r\n",
+    );
+    let default_str = String::from_utf8_lossy(&default);
+    assert!(
+        default_str.contains("default host"),
+        "expected 'default host', got: {default_str:.120}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 24. Precedence — method-specific beats method-agnostic for same path
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn method_wildcard_precedence() {
+    let port = next_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mux = Arc::new(ServeMux::new());
+    // Method-specific route (higher specificity).
+    mux.handle_func("GET /things/{id}", |w, r| {
+        let id = r.path_value("id").to_owned();
+        w.header().set("X-Handler", "get-specific");
+        let _ = w.write(format!("GET id={id}").as_bytes());
+    });
+    // Method-agnostic fallback.
+    mux.handle_func("/things/{id}", |w, r| {
+        let id = r.path_value("id").to_owned();
+        w.header().set("X-Handler", "any-method");
+        let _ = w.write(format!("ANY id={id}").as_bytes());
+    });
+    start_server_goroutine(addr.clone(), mux);
+
+    // GET → method-specific handler wins.
+    let get_resp = Client::new()
+        .get(&format!("http://127.0.0.1:{port}/things/99"))
+        .expect("GET /things/99");
+    assert_eq!(get_resp.status, status::OK);
+    assert_eq!(get_resp.header.get("X-Handler"), Some("get-specific"));
+
+    // POST → method-agnostic fallback.
+    let body = Body::Unbounded(Box::new(std::io::Cursor::new(b"".to_vec())));
+    let post_resp = Client::new()
+        .post(&format!("http://127.0.0.1:{port}/things/99"), "text/plain", body)
+        .expect("POST /things/99");
+    assert_eq!(post_resp.status, status::OK);
+    assert_eq!(post_resp.header.get("X-Handler"), Some("any-method"));
 }

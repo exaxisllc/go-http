@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use go_lib::chan::{chan, Sender};
 use go_lib::net::{TcpListener, TcpStream};
+use go_lib::sync::WaitGroup;
 use rustls::ServerConnection;
 use url::Url;
 
@@ -53,6 +54,9 @@ pub struct Server {
     pub max_body_bytes: Option<u64>,
     /// Populated by `listen_and_serve`; send `()` to request shutdown.
     shutdown_tx: Mutex<Option<Sender<()>>>,
+    /// Tracks the number of active connections.  `shutdown()` waits on this
+    /// so it returns only after all in-flight requests finish.
+    active_conns: Arc<WaitGroup>,
 }
 
 impl Server {
@@ -66,6 +70,7 @@ impl Server {
             max_header_bytes: DEFAULT_MAX_HEADER_BYTES,
             max_body_bytes:   None,
             shutdown_tx:      Mutex::new(None),
+            active_conns:     Arc::new(WaitGroup::new()),
         }
     }
 
@@ -84,6 +89,8 @@ impl Server {
         };
         let max_header_bytes = self.max_header_bytes;
         let max_body_bytes   = self.max_body_bytes;
+        let idle_timeout     = self.idle_timeout;
+        let active_conns     = Arc::clone(&self.active_conns);
 
         // Shutdown signal (buffered so shutdown() never blocks).
         let (shutdown_tx, shutdown_rx) = chan::<()>(1);
@@ -118,9 +125,12 @@ impl Server {
                     match conn {
                         None         => break,
                         Some(stream) => {
-                            let h = Arc::clone(&handler);
+                            let h  = Arc::clone(&handler);
+                            let wg = Arc::clone(&active_conns);
+                            wg.add(1);
                             go_lib::go!(move || {
-                                serve_conn(stream, h, max_header_bytes, max_body_bytes);
+                                serve_conn(stream, h, max_header_bytes, max_body_bytes, idle_timeout);
+                                wg.done();
                             });
                         }
                     }
@@ -153,6 +163,8 @@ impl Server {
         };
         let max_header_bytes = self.max_header_bytes;
         let max_body_bytes   = self.max_body_bytes;
+        let idle_timeout     = self.idle_timeout;
+        let active_conns     = Arc::clone(&self.active_conns);
 
         let (shutdown_tx, shutdown_rx) = chan::<()>(1);
         *self.shutdown_tx.lock().unwrap() = Some(shutdown_tx);
@@ -181,8 +193,11 @@ impl Server {
                         Some(stream) => {
                             let h   = Arc::clone(&handler);
                             let cfg = Arc::clone(&tls_config);
+                            let wg  = Arc::clone(&active_conns);
+                            wg.add(1);
                             go_lib::go!(move || {
-                                serve_conn_tls(stream, cfg, h, max_header_bytes, max_body_bytes);
+                                serve_conn_tls(stream, cfg, h, max_header_bytes, max_body_bytes, idle_timeout);
+                                wg.done();
                             });
                         }
                     }
@@ -193,14 +208,21 @@ impl Server {
         Ok(())
     }
 
-    /// Signal the server to stop accepting new connections.
-    /// Port of Go's `(*Server).Shutdown` (simplified).
+    /// Stop accepting new connections and wait for all active connections to
+    /// finish serving their current requests.
+    ///
+    /// Returns only after the last in-flight handler has returned, so callers
+    /// can safely clean up resources after `shutdown()` completes.
+    ///
+    /// Port of Go's `(*Server).Shutdown` (simplified — no context deadline).
     pub fn shutdown(&self) {
         if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
             let _ = std::panic::catch_unwind(
                 std::panic::AssertUnwindSafe(|| tx.send(()))
             );
         }
+        // Parks the calling goroutine until active_conns reaches zero.
+        self.active_conns.wait();
     }
 }
 
@@ -220,6 +242,7 @@ fn serve_conn(
     handler:          Arc<dyn Handler>,
     max_header_bytes: usize,
     max_body_bytes:   Option<u64>,
+    idle_timeout:     Option<Duration>,
 ) {
     let remote_addr = stream.peer_addr()
         .map(|a| a.to_string())
@@ -231,7 +254,39 @@ fn serve_conn(
         Err(_) => return,
     };
 
+    // Raw fd used by the idle-timeout watchdog to interrupt read_request().
+    // The fd remains valid for the lifetime of `stream`; the watchdog takes
+    // a non-owning view via from_raw_fd + forget.
+    #[cfg(unix)]
+    let raw_fd = stream.as_raw_fd();
+
     loop {
+        // ── Idle timeout watchdog ─────────────────────────────────────────────
+        // Spawn a goroutine that fires after `idle_timeout` and shuts down the
+        // read side of the socket, causing read_request() to return an error.
+        // Cancelled by sending on idle_cancel_tx when the read completes.
+        let (idle_cancel_tx, idle_cancel_rx) = go_lib::chan::chan::<()>(1);
+        if let Some(dur) = idle_timeout {
+            let (ctx, _cancel) = go_lib::context::with_timeout(
+                &go_lib::context::background(), dur,
+            );
+            go_lib::go!(move || {
+                go_lib::select! {
+                    recv(ctx.done())     -> _sig => {
+                        #[cfg(unix)] {
+                            use std::os::unix::io::FromRawFd;
+                            // SAFETY: raw_fd is valid while stream is alive; we forget
+                            // the TcpStream wrapper immediately so the fd is not closed.
+                            let s = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
+                            let _ = s.shutdown(std::net::Shutdown::Read);
+                            std::mem::forget(s);
+                        }
+                    }
+                    recv(idle_cancel_rx) -> _sig => {}
+                }
+            });
+        }
+
         // ── Parse the next request ────────────────────────────────────────────
         // Clone the stream for this request's read half.  try_clone() calls
         // dup(2)/DuplicateHandle so the clone shares the same TCP socket read
@@ -244,7 +299,7 @@ fn serve_conn(
         };
 
         let parsed = match read_request(read_half, max_header_bytes) {
-            Ok(p)  => p,
+            Ok(p)  => { let _ = idle_cancel_tx.try_send(()); p }
             Err(_) => break,
         };
 
@@ -357,10 +412,15 @@ fn serve_conn_tls(
     handler:          Arc<dyn Handler>,
     max_header_bytes: usize,
     max_body_bytes:   Option<u64>,
+    idle_timeout:     Option<Duration>,
 ) {
     let remote_addr = stream.peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_default();
+
+    // Capture raw fd before moving stream into StreamOwned.
+    #[cfg(unix)]
+    let raw_fd = stream.as_raw_fd();
 
     let server_conn = match ServerConnection::new(tls_config) {
         Ok(c)  => c,
@@ -369,6 +429,27 @@ fn serve_conn_tls(
     let mut tls = rustls::StreamOwned::new(server_conn, stream);
 
     loop {
+        // ── Idle timeout watchdog ─────────────────────────────────────────────
+        let (idle_cancel_tx, idle_cancel_rx) = go_lib::chan::chan::<()>(1);
+        if let Some(dur) = idle_timeout {
+            let (ctx, _cancel) = go_lib::context::with_timeout(
+                &go_lib::context::background(), dur,
+            );
+            go_lib::go!(move || {
+                go_lib::select! {
+                    recv(ctx.done())     -> _sig => {
+                        #[cfg(unix)] {
+                            use std::os::unix::io::FromRawFd;
+                            let s = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
+                            let _ = s.shutdown(std::net::Shutdown::Read);
+                            std::mem::forget(s);
+                        }
+                    }
+                    recv(idle_cancel_rx) -> _sig => {}
+                }
+            });
+        }
+
         // ── Parse ─────────────────────────────────────────────────────────────
         // SAFETY: `tls` outlives `read_ptr` and there is no concurrent access.
         // The raw pointer is stored inside the Body returned by read_request.
@@ -377,7 +458,7 @@ fn serve_conn_tls(
         // goroutine — there is never simultaneous read + write access.
         let read_ptr: *mut dyn Read = &mut tls as &mut dyn Read as *mut dyn Read;
         let parsed = match read_request(RawTlsRead(read_ptr), max_header_bytes) {
-            Ok(p)  => p,
+            Ok(p)  => { let _ = idle_cancel_tx.try_send(()); p }
             Err(_) => break,
         };
 
