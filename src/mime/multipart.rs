@@ -51,7 +51,7 @@ impl<R: Read> Reader<R> {
                 self.done = true;
                 return Ok(None);
             }
-            let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
+            let trimmed = line.trim_end_matches(['\r', '\n']);
             if trimmed.as_bytes() == self.delim.as_slice() {
                 // Found a part boundary — read headers.
                 let header = read_part_headers(&mut self.inner)?;
@@ -131,7 +131,7 @@ fn read_part_headers<R: Read>(r: &mut BufReader<R>) -> Result<Header, MimeError>
         if n == 0 {
             break;
         }
-        let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
+        let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
         }

@@ -22,7 +22,8 @@ pub trait Handler: Send + Sync {
 
 /// Adapter that turns a function into a `Handler`.
 /// Port of Go's `http.HandlerFunc`.
-pub struct HandlerFunc(pub Box<dyn Fn(&mut dyn ResponseWriter, &Request) + Send + Sync>);
+type HandlerFn = Box<dyn Fn(&mut dyn ResponseWriter, &Request) + Send + Sync>;
+pub struct HandlerFunc(pub HandlerFn);
 
 impl Handler for HandlerFunc {
     fn serve_http(&self, w: &mut dyn ResponseWriter, r: &Request) {
