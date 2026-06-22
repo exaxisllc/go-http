@@ -160,19 +160,18 @@ impl Request {
             .to_ascii_lowercase();
         if matches!(self.method.as_str(), "POST" | "PUT" | "PATCH")
             && ct.starts_with("application/x-www-form-urlencoded")
+            && let Some(body) = self.body.take()
         {
-            if let Some(body) = self.body.take() {
-                let mut raw = Vec::new();
-                BodyReader(body)
-                    .read_to_end(&mut raw)
-                    .map_err(|_| HttpError::BodyRead)?;
-                let s = String::from_utf8_lossy(&raw);
-                for pair in s.split('&') {
-                    if let Some((k, v)) = pair.split_once('=') {
-                        let k = url_decode(k);
-                        let v = url_decode(v);
-                        values.entry(k).or_default().push(v);
-                    }
+            let mut raw = Vec::new();
+            BodyReader(body)
+                .read_to_end(&mut raw)
+                .map_err(|_| HttpError::BodyRead)?;
+            let s = String::from_utf8_lossy(&raw);
+            for pair in s.split('&') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    let k = url_decode(k);
+                    let v = url_decode(v);
+                    values.entry(k).or_default().push(v);
                 }
             }
         }

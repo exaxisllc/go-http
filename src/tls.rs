@@ -81,7 +81,7 @@ pub fn client_config_with_ca(ca_file: &str) -> Result<Arc<rustls::ClientConfig>,
 // ---------------------------------------------------------------------------
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, HttpError> {
-    let f   = fs::File::open(path).map_err(|e| HttpError::Io(e))?;
+    let f   = fs::File::open(path).map_err(HttpError::Io)?;
     let mut r = BufReader::new(f);
     rustls_pemfile::certs(&mut r)
         .collect::<Result<Vec<_>, _>>()

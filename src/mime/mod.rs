@@ -222,7 +222,7 @@ fn starts_with_ci(haystack: &[u8], needle: &[u8]) -> bool {
         && haystack[..needle.len()]
             .iter()
             .zip(needle.iter())
-            .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
 // ---------------------------------------------------------------------------
@@ -261,8 +261,8 @@ fn parse_params(s: &str) -> Result<HashMap<String, String>, MimeError> {
         }
         rest = rest[eq + 1..].trim_start();
 
-        let (value, remaining) = if rest.starts_with('"') {
-            consume_quoted_string(&rest[1..])?
+        let (value, remaining) = if let Some(s) = rest.strip_prefix('"') {
+            consume_quoted_string(s)?
         } else {
             // Token value — read until ';' or end.
             let end = rest.find(';').unwrap_or(rest.len());

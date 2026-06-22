@@ -54,7 +54,7 @@ impl<R: Read> ChunkedReader<R> {
         // Strip chunk extensions (anything after ';').
         let s = std::str::from_utf8(&line)
             .map_err(|_| ParseError::InvalidChunkSize)?
-            .splitn(2, ';')
+            .split(';')
             .next()
             .unwrap_or("")
             .trim();

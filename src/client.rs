@@ -299,17 +299,13 @@ impl Client {
 
             // POST → GET on 301/302/303 (matching Go semantics).
             let new_method = match status {
-                301 | 302 | 303 => {
+                301..=303 => {
                     if method == "POST" { "GET".to_owned() } else { method }
                 }
                 _ => method,
             };
 
-            let body = if new_method == "GET" || new_method == "HEAD" {
-                None
-            } else {
-                None // body consumed; caller must handle 307/308 with body separately
-            };
+            let body = None; // body consumed; caller must handle 307/308 with body separately
 
             let mut new_req = Request::new(&new_method, new_url.as_str(), body)?;
             // Forward safe headers; strip Authorization on cross-origin redirects.
