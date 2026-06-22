@@ -2,7 +2,7 @@
 
 /// Response and ResponseWriter — port of Go's `net/http.Response` and
 /// `net/http.ResponseWriter`.
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 
 use crate::error::HttpError;
 use crate::header::Header;
@@ -142,13 +142,15 @@ pub struct Response {
 }
 
 impl Response {
-    /// Read the entire body into a `Vec<u8>` and close it.
+    /// Read the entire body into a `Vec<u8>`, populate `self.trailer` from any
+    /// chunked trailer headers, and close the body.
     pub fn body_bytes(&mut self) -> Result<Vec<u8>, HttpError> {
         let mut out = Vec::new();
+        if let Some(ref mut body) = self.body {
+            body.read_to_end(&mut out).map_err(|_| HttpError::BodyRead)?;
+        }
         if let Some(body) = self.body.take() {
-            BodyReader(body)
-                .read_to_end(&mut out)
-                .map_err(|_| HttpError::BodyRead)?;
+            self.trailer = body.into_trailers();
         }
         Ok(out)
     }
@@ -161,12 +163,6 @@ impl Response {
     }
 }
 
-struct BodyReader(Body);
-impl Read for BodyReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
-    }
-}
 
 #[cfg(test)]
 mod tests {
