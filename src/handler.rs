@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -49,33 +50,70 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// ServeMux
+// ServeMux — Go 1.22-style routing
 // ---------------------------------------------------------------------------
 
-struct MuxEntry {
-    handler: Arc<dyn Handler>,
-    pattern: String,
+/// A single parsed segment of a URL pattern.
+#[derive(Clone, Debug)]
+enum Segment {
+    Literal(String),
+    /// `{name}` — matches exactly one path component.
+    Wildcard { name: String },
+    /// `{name...}` — matches all remaining path components (must be last).
+    Tail { name: String },
 }
 
-/// HTTP request multiplexer.  Port of Go's `http.ServeMux`.
+/// A fully parsed mux pattern supporting method prefix, host prefix, and
+/// wildcard path segments as introduced in Go 1.22.
 ///
-/// Matching rules (same as Go):
-/// 1. Exact match wins over prefix match.
-/// 2. Among prefix matches, the longest pattern wins.
-/// 3. Patterns ending with `/` are subtree patterns (prefix match).
-/// 4. Patterns not ending with `/` are exact match only.
+/// Grammar: `[METHOD ][HOST]/PATH`
+///   - `METHOD` is optional; any capitalized HTTP method word.
+///   - `HOST` is optional; present when the pattern does not start with `/`.
+///   - `PATH` may contain `{name}` (wildcard segment) and `{name...}` (tail).
+#[derive(Clone, Debug)]
+struct ParsedPattern {
+    method:             Option<String>,
+    host:               Option<String>,
+    segments:           Vec<Segment>,
+    has_trailing_slash: bool,
+}
+
+struct MuxEntry {
+    raw:     String,
+    parsed:  ParsedPattern,
+    handler: Arc<dyn Handler>,
+}
+
+/// HTTP request multiplexer.  Port of Go's `http.ServeMux` (Go 1.22+).
+///
+/// Matching rules:
+/// 1. More-specific patterns beat less-specific ones (method + host > host > path).
+/// 2. Literal path segments beat wildcard segments; wildcards beat tail wildcards.
+/// 3. Exact path beats trailing-slash subtree of the same length.
+/// 4. Among equally-specific patterns, longer paths win.
+/// 5. A pattern matching path but not method returns 405 Method Not Allowed.
 pub struct ServeMux {
     entries: RwLock<Vec<MuxEntry>>,
 }
 
 impl ServeMux {
     pub fn new() -> Self {
-        Self {
-            entries: RwLock::new(Vec::new()),
-        }
+        Self { entries: RwLock::new(Vec::new()) }
     }
 
     /// Register a handler for the given pattern.
+    ///
+    /// Pattern syntax: `[METHOD ][HOST]/PATH`
+    ///
+    /// | Example                  | Meaning                                      |
+    /// |--------------------------|----------------------------------------------|
+    /// | `/`                      | subtree catch-all (old-style)                |
+    /// | `/api/v2/`               | subtree prefix                               |
+    /// | `/items/{id}`            | single wildcard segment                      |
+    /// | `/files/{path...}`       | tail wildcard (matches rest of path)         |
+    /// | `GET /api/users`         | method-restricted exact route                |
+    /// | `example.com/`           | host-restricted subtree                      |
+    /// | `GET example.com/{id}`   | method + host + wildcard                     |
     pub fn handle(&self, pattern: &str, handler: impl Handler + 'static) {
         self.handle_arc(pattern, Arc::new(handler));
     }
@@ -89,46 +127,42 @@ impl ServeMux {
     }
 
     fn handle_arc(&self, pattern: &str, handler: Arc<dyn Handler>) {
+        let parsed = parse_pattern(pattern);
         let mut entries = self.entries.write().unwrap();
-        // Replace existing entry for the same pattern.
-        if let Some(e) = entries.iter_mut().find(|e| e.pattern == pattern) {
+        if let Some(e) = entries.iter_mut().find(|e| e.raw == pattern) {
             e.handler = handler;
             return;
         }
-        entries.push(MuxEntry { handler, pattern: pattern.to_owned() });
+        entries.push(MuxEntry { raw: pattern.to_owned(), parsed, handler });
     }
 
-    /// Find the best matching handler for `path`.
+    /// Find the best matching handler for a bare `path` (no method/host
+    /// filtering).  Retained for backward compatibility; prefer the full
+    /// `serve_http` path for new code.
     pub fn match_handler(&self, path: &str) -> Option<Arc<dyn Handler>> {
         let entries = self.entries.read().unwrap();
-        let mut best_len = 0usize;
-        let mut best: Option<Arc<dyn Handler>> = None;
-
-        for entry in entries.iter() {
-            let pat = entry.pattern.as_str();
-            if pat.ends_with('/') {
-                // Subtree (prefix) match.
-                if path.starts_with(pat) && pat.len() > best_len {
-                    best_len = pat.len();
-                    best = Some(Arc::clone(&entry.handler));
-                }
-            } else {
-                // Exact match — wins immediately if found.
-                if path == pat {
-                    return Some(Arc::clone(&entry.handler));
-                }
-            }
-        }
-        best
+        let (h, _, _) = match_with_params(&entries, "", "", path);
+        h
     }
 }
 
 impl Handler for ServeMux {
     fn serve_http(&self, w: &mut dyn ResponseWriter, r: &mut Request) {
-        let path = r.url.path();
-        match self.match_handler(path) {
-            Some(h) => h.serve_http(w, r),
-            None    => not_found_handler().serve_http(w, r),
+        let entries = self.entries.read().unwrap();
+        let (handler, params, method_not_allowed) =
+            match_with_params(&entries, &r.method, &r.host, r.url.path());
+        drop(entries);
+
+        match handler {
+            Some(h) => {
+                r.path_params = params;
+                h.serve_http(w, r);
+            }
+            None if method_not_allowed => {
+                w.write_header(crate::status::METHOD_NOT_ALLOWED);
+                let _ = w.write(b"405 method not allowed\n");
+            }
+            None => not_found_handler().serve_http(w, r),
         }
     }
 }
@@ -137,6 +171,182 @@ impl Default for ServeMux {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pattern parsing
+// ---------------------------------------------------------------------------
+
+/// HTTP methods recognised as pattern prefixes.
+const KNOWN_METHODS: &[&str] = &[
+    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "CONNECT", "OPTIONS", "TRACE",
+];
+
+fn parse_pattern(raw: &str) -> ParsedPattern {
+    let mut s = raw;
+
+    // 1. Optional method prefix: "GET /path" or "POST example.com/path"
+    let method = {
+        let upper = s.to_ascii_uppercase();
+        let mut found = None;
+        for &m in KNOWN_METHODS {
+            if upper.starts_with(m)
+                && s[m.len()..].starts_with(' ')
+            {
+                found = Some(m.to_owned());
+                s = s[m.len() + 1..].trim_start();
+                break;
+            }
+        }
+        found
+    };
+
+    // 2. Optional host prefix: present when the remainder doesn't start with '/'
+    let host = if !s.starts_with('/') {
+        let slash = s.find('/').unwrap_or(s.len());
+        let h = s[..slash].to_owned();
+        s = if slash < s.len() { &s[slash..] } else { "/" };
+        Some(h)
+    } else {
+        None
+    };
+
+    // 3. Parse path segments
+    let has_trailing_slash = s.len() > 1 && s.ends_with('/');
+    let path_body = if has_trailing_slash { &s[..s.len() - 1] } else { s };
+
+    let segments: Vec<Segment> = path_body
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .map(parse_segment)
+        .collect();
+
+    ParsedPattern { method, host, segments, has_trailing_slash }
+}
+
+fn parse_segment(seg: &str) -> Segment {
+    if seg.starts_with('{') && seg.ends_with('}') {
+        let inner = &seg[1..seg.len() - 1];
+        if let Some(name) = inner.strip_suffix("...") {
+            return Segment::Tail { name: name.to_owned() };
+        }
+        return Segment::Wildcard { name: inner.to_owned() };
+    }
+    Segment::Literal(seg.to_owned())
+}
+
+// ---------------------------------------------------------------------------
+// Match logic
+// ---------------------------------------------------------------------------
+
+/// Specificity score: higher = more specific = wins when multiple patterns match.
+fn specificity(p: &ParsedPattern) -> i64 {
+    let mut score: i64 = 0;
+    if p.method.is_some() { score += 10_000_000; }
+    if p.host.is_some()   { score +=  1_000_000; }
+    for seg in &p.segments {
+        score += match seg {
+            Segment::Literal(_)      => 10_000,
+            Segment::Wildcard { .. } =>  1_000,
+            Segment::Tail { .. }     =>    100,
+        };
+    }
+    // Exact paths (no trailing slash, no tail) beat same-length subtree patterns.
+    let has_tail = p.segments.iter().any(|s| matches!(s, Segment::Tail { .. }));
+    if !p.has_trailing_slash && !has_tail { score += 1; }
+    score
+}
+
+/// Try to match `parts` against `segments`.  Returns captured params on success.
+fn try_match_path(
+    segments:           &[Segment],
+    parts:              &[&str],
+    has_trailing_slash: bool,
+) -> Option<HashMap<String, String>> {
+    let mut params = HashMap::new();
+
+    for (i, seg) in segments.iter().enumerate() {
+        match seg {
+            Segment::Tail { name } => {
+                // Captures all remaining parts, joined.
+                let tail = parts[i..].join("/");
+                if !name.is_empty() {
+                    params.insert(name.clone(), tail);
+                }
+                return Some(params);
+            }
+            Segment::Wildcard { name } => {
+                let part = parts.get(i)?;
+                if !name.is_empty() {
+                    params.insert(name.clone(), (*part).to_owned());
+                }
+            }
+            Segment::Literal(lit) => {
+                if parts.get(i)? != lit { return None; }
+            }
+        }
+    }
+
+    if parts.len() == segments.len() {
+        return Some(params);
+    }
+    // Trailing-slash subtree: path may extend beyond the pattern's segments.
+    if has_trailing_slash && parts.len() > segments.len() {
+        return Some(params);
+    }
+    None
+}
+
+/// Find the best handler for a request, returning captured path params and a
+/// `method_not_allowed` flag.  An empty `method` or `host` skips those filters
+/// (used by the backward-compat `match_handler` shim).
+fn match_with_params(
+    entries: &[MuxEntry],
+    method:  &str,
+    host:    &str,
+    path:    &str,
+) -> (Option<Arc<dyn Handler>>, HashMap<String, String>, bool) {
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    let mut best_handler: Option<Arc<dyn Handler>> = None;
+    let mut best_params  = HashMap::new();
+    let mut best_score:  i64 = i64::MIN;
+    let mut method_not_allowed = false;
+
+    for entry in entries {
+        let pat = &entry.parsed;
+
+        let Some(params) = try_match_path(&pat.segments, &parts, pat.has_trailing_slash)
+        else { continue };
+
+        // Host filter (only when caller supplies a host).
+        if !host.is_empty()
+            && let Some(ref ph) = pat.host
+            && !host.eq_ignore_ascii_case(ph)
+        {
+            continue;
+        }
+
+        // Method filter (only when caller supplies a method).
+        if !method.is_empty()
+            && let Some(ref pm) = pat.method
+            && !method.eq_ignore_ascii_case(pm)
+        {
+            method_not_allowed = true;
+            continue;
+        }
+
+        let score = specificity(pat);
+        if score > best_score {
+            best_score   = score;
+            best_handler = Some(Arc::clone(&entry.handler));
+            best_params  = params;
+        }
+    }
+
+    // Only surface 405 if there was no method-agnostic match.
+    let mna = method_not_allowed && best_handler.is_none();
+    (best_handler, best_params, mna)
 }
 
 // ---------------------------------------------------------------------------
@@ -398,6 +608,7 @@ fn rebuild_request(r: &Request, new_url: url::Url) -> Result<Request, HttpError>
     req.transfer_encoding = r.transfer_encoding.clone();
     req.remote_addr       = r.remote_addr.clone();
     req.trailer           = r.trailer.clone();
+    req.path_params       = r.path_params.clone();
     Ok(req)
 }
 
