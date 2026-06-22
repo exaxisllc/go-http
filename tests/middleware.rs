@@ -223,7 +223,7 @@ impl Handler for LoggingHandler {
     fn serve_http(
         &self,
         w: &mut dyn go_http::response::ResponseWriter,
-        r: &go_http::request::Request,
+        r: &mut go_http::request::Request,
     ) {
         self.log.lock().unwrap().push(r.url.path().to_owned());
         self.inner.serve_http(w, r);

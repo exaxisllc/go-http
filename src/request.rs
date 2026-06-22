@@ -137,6 +137,25 @@ impl Request {
         self.cookies().into_iter().find(|c| c.name == name)
     }
 
+    // ── Body helpers ─────────────────────────────────────────────────────────
+
+    /// Read the entire request body, populate `self.trailer` from any chunked
+    /// trailer headers, and return the raw bytes.
+    pub fn body_bytes(&mut self) -> Result<Vec<u8>, HttpError> {
+        let mut out = Vec::new();
+        if let Some(ref mut body) = self.body {
+            body.read_to_end(&mut out).map_err(|_| HttpError::BodyRead)?;
+            self.trailer = body.trailers().clone();
+        }
+        Ok(out)
+    }
+
+    /// Trailer headers declared by the client.  Populated after the body has
+    /// been fully read via `body_bytes` or a manual `read_to_end`.
+    pub fn trailers(&self) -> &Header {
+        &self.trailer
+    }
+
     // ── Form parsing ──────────────────────────────────────────────────────────
 
     /// Parse application/x-www-form-urlencoded body or query string.

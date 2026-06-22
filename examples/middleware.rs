@@ -28,7 +28,7 @@ struct LoggingHandler {
 }
 
 impl Handler for LoggingHandler {
-    fn serve_http(&self, w: &mut dyn ResponseWriter, r: &Request) {
+    fn serve_http(&self, w: &mut dyn ResponseWriter, r: &mut Request) {
         let start = std::time::Instant::now();
         self.inner.serve_http(w, r);
         let elapsed = start.elapsed();

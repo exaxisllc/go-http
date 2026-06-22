@@ -13,7 +13,7 @@
 /// (go-lib ≥ 0.5.1), so `serve_conn` uses `stream.try_clone()` to split the
 /// connection into independent read and write halves — no unsafe fd
 /// manipulation required.
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,8 +24,10 @@ use url::Url;
 
 use crate::error::HttpError;
 use crate::handler::{default_serve_mux, Handler};
+use crate::header::Header;
 use crate::parse::request::{read_request, DEFAULT_MAX_HEADER_BYTES};
 use crate::parse::transfer::Body;
+use crate::status;
 use crate::request::Request;
 use crate::response::{ConnResponseWriter, ResponseWriter};
 
@@ -44,6 +46,11 @@ pub struct Server {
     pub idle_timeout:  Option<Duration>,
     /// Maximum bytes consumed while reading request headers.
     pub max_header_bytes: usize,
+    /// Maximum request body size in bytes.  `None` means unlimited.
+    /// Requests with a known Content-Length exceeding this limit are rejected
+    /// with 413 before the handler runs.  Chunked bodies are wrapped in a
+    /// capped reader that returns an error when the limit is exceeded.
+    pub max_body_bytes: Option<u64>,
     /// Populated by `listen_and_serve`; send `()` to request shutdown.
     shutdown_tx: Mutex<Option<Sender<()>>>,
 }
@@ -57,6 +64,7 @@ impl Server {
             write_timeout:    None,
             idle_timeout:     None,
             max_header_bytes: DEFAULT_MAX_HEADER_BYTES,
+            max_body_bytes:   None,
             shutdown_tx:      Mutex::new(None),
         }
     }
@@ -75,6 +83,7 @@ impl Server {
             None    => default_serve_mux(),
         };
         let max_header_bytes = self.max_header_bytes;
+        let max_body_bytes   = self.max_body_bytes;
 
         // Shutdown signal (buffered so shutdown() never blocks).
         let (shutdown_tx, shutdown_rx) = chan::<()>(1);
@@ -111,7 +120,7 @@ impl Server {
                         Some(stream) => {
                             let h = Arc::clone(&handler);
                             go_lib::go!(move || {
-                                serve_conn(stream, h, max_header_bytes);
+                                serve_conn(stream, h, max_header_bytes, max_body_bytes);
                             });
                         }
                     }
@@ -143,6 +152,7 @@ impl Server {
             None    => default_serve_mux(),
         };
         let max_header_bytes = self.max_header_bytes;
+        let max_body_bytes   = self.max_body_bytes;
 
         let (shutdown_tx, shutdown_rx) = chan::<()>(1);
         *self.shutdown_tx.lock().unwrap() = Some(shutdown_tx);
@@ -172,7 +182,7 @@ impl Server {
                             let h   = Arc::clone(&handler);
                             let cfg = Arc::clone(&tls_config);
                             go_lib::go!(move || {
-                                serve_conn_tls(stream, cfg, h, max_header_bytes);
+                                serve_conn_tls(stream, cfg, h, max_header_bytes, max_body_bytes);
                             });
                         }
                     }
@@ -209,6 +219,7 @@ fn serve_conn(
     stream:           TcpStream,
     handler:          Arc<dyn Handler>,
     max_header_bytes: usize,
+    max_body_bytes:   Option<u64>,
 ) {
     let remote_addr = stream.peer_addr()
         .map(|a| a.to_string())
@@ -242,11 +253,45 @@ fn serve_conn(
             hdr.contains("close") || parsed.proto_minor == 0
         };
 
+        // ── Expect / body-size pre-checks ─────────────────────────────────────
+        // Check Expect header before inspecting body size; an unrecognised
+        // expectation is an immediate 417 regardless of body length.
+        let expect = check_expect(&parsed.header);
+        if let ExpectResult::Unknown = &expect {
+            send_error_response(&mut write_half, status::EXPECTATION_FAILED);
+            break;
+        }
+
+        // Reject oversized Content-Length bodies before dispatching.
+        if let Some(max) = max_body_bytes
+            && parsed.content_length > 0 && parsed.content_length as u64 > max
+        {
+            send_error_response(&mut write_half, status::REQUEST_ENTITY_TOO_LARGE);
+            break;
+        }
+
+        // Send provisional 100 Continue.  write_half is an independent fd clone
+        // — safe to write while the body wrapper (on the stream clone) exists.
+        if let ExpectResult::Continue = expect {
+            let _ = write_half.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+            let _ = write_half.flush();
+        }
+
         // ── Build Request ─────────────────────────────────────────────────────
-        let req = match build_request(parsed, remote_addr.clone()) {
+        let mut req = match build_request(parsed, remote_addr.clone()) {
             Ok(r)  => r,
             Err(_) => break,
         };
+
+        // Wrap chunked / unbounded bodies with a hard byte cap so oversized
+        // payloads surface as an IO error to the handler rather than silently
+        // consuming unbounded memory.
+        if let Some(max) = max_body_bytes
+            && matches!(req.body, Some(Body::Chunked(_)) | Some(Body::Unbounded(_)))
+        {
+            let old = req.body.take().unwrap();
+            req.body = Some(old.capped(max));
+        }
 
         // ── Dispatch ──────────────────────────────────────────────────────────
         let mut w = ConnResponseWriter::new(&mut write_half);
@@ -255,10 +300,20 @@ fn serve_conn(
             w.header().set("Connection", "close");
         }
 
-        handler.serve_http(&mut w, &req);
+        handler.serve_http(&mut w, &mut req);
 
         if w.finish().is_err() {
             break;
+        }
+
+        // ── Keep-alive body drain ─────────────────────────────────────────────
+        // If the handler did not consume the request body, drain it now so that
+        // leftover bytes are not misread as the next request's data.
+        if !connection_close
+            && let Some(ref mut body) = req.body
+        {
+            let mut drain = [0u8; 8192];
+            while body.read(&mut drain).map(|n| n > 0).unwrap_or(false) {}
         }
 
         if connection_close {
@@ -301,6 +356,7 @@ fn serve_conn_tls(
     tls_config:       Arc<rustls::ServerConfig>,
     handler:          Arc<dyn Handler>,
     max_header_bytes: usize,
+    max_body_bytes:   Option<u64>,
 ) {
     let remote_addr = stream.peer_addr()
         .map(|a| a.to_string())
@@ -315,6 +371,10 @@ fn serve_conn_tls(
     loop {
         // ── Parse ─────────────────────────────────────────────────────────────
         // SAFETY: `tls` outlives `read_ptr` and there is no concurrent access.
+        // The raw pointer is stored inside the Body returned by read_request.
+        // All reads through it happen before the first response write, and all
+        // writes (100 Continue, full response) happen sequentially in this
+        // goroutine — there is never simultaneous read + write access.
         let read_ptr: *mut dyn Read = &mut tls as &mut dyn Read as *mut dyn Read;
         let parsed = match read_request(RawTlsRead(read_ptr), max_header_bytes) {
             Ok(p)  => p,
@@ -326,25 +386,65 @@ fn serve_conn_tls(
             hdr.contains("close") || parsed.proto_minor == 0
         };
 
+        // ── Expect / body-size pre-checks ─────────────────────────────────────
+        let expect = check_expect(&parsed.header);
+        if let ExpectResult::Unknown = &expect {
+            send_error_response(&mut tls, status::EXPECTATION_FAILED);
+            break;
+        }
+
+        if let Some(max) = max_body_bytes
+            && parsed.content_length > 0 && parsed.content_length as u64 > max
+        {
+            send_error_response(&mut tls, status::REQUEST_ENTITY_TOO_LARGE);
+            break;
+        }
+
+        // SAFETY: Writing 100 Continue through `&mut tls` while Body holds a
+        // RawTlsRead(*mut tls) is safe here: the body has not been read yet,
+        // the write is synchronous and completes before the handler sees the
+        // body, and the goroutine is single-threaded (no concurrent access).
+        if let ExpectResult::Continue = expect {
+            let _ = tls.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+            let _ = tls.flush();
+        }
+
         // ── Build Request ─────────────────────────────────────────────────────
         // Use https:// scheme for the reconstructed URL.
-        let req = match build_request_scheme(parsed, remote_addr.clone(), "https") {
+        let mut req = match build_request_scheme(parsed, remote_addr.clone(), "https") {
             Ok(r)  => r,
             Err(_) => break,
         };
 
+        if let Some(max) = max_body_bytes
+            && matches!(req.body, Some(Body::Chunked(_)) | Some(Body::Unbounded(_)))
+        {
+            let old = req.body.take().unwrap();
+            req.body = Some(old.capped(max));
+        }
+
         // ── Dispatch ──────────────────────────────────────────────────────────
-        // The body has been consumed (or is empty) — safe to use tls for writes.
+        // Response writes go through `&mut tls`.  The body (RawTlsRead) must
+        // not be read concurrently with response writes; they are sequenced:
+        // the handler reads the body first, then writes the response.
         let mut w = ConnResponseWriter::new(&mut tls);
         w.header().set("Server", "go-http/0.1");
         if connection_close {
             w.header().set("Connection", "close");
         }
 
-        handler.serve_http(&mut w, &req);
+        handler.serve_http(&mut w, &mut req);
 
         if w.finish().is_err() {
             break;
+        }
+
+        // ── Keep-alive body drain ─────────────────────────────────────────────
+        if !connection_close
+            && let Some(ref mut body) = req.body
+        {
+            let mut drain = [0u8; 8192];
+            while body.read(&mut drain).map(|n| n > 0).unwrap_or(false) {}
         }
 
         if connection_close {
@@ -432,6 +532,37 @@ pub fn listen_and_serve_tls(
 
 pub use crate::handler::handle;
 pub use crate::handler::handle_func;
+
+// ---------------------------------------------------------------------------
+// Expect header helpers
+// ---------------------------------------------------------------------------
+
+enum ExpectResult {
+    None,
+    Continue,
+    Unknown,
+}
+
+fn check_expect(header: &Header) -> ExpectResult {
+    match header.get("Expect") {
+        None    => ExpectResult::None,
+        Some(v) if v.eq_ignore_ascii_case("100-continue") => ExpectResult::Continue,
+        Some(_) => ExpectResult::Unknown,
+    }
+}
+
+/// Write a minimal error response and flush.
+fn send_error_response<W: Write>(w: &mut W, code: u16) {
+    let text = crate::status::status_text(code);
+    let body = format!("{code} {text}\n");
+    let _ = write!(
+        w,
+        "HTTP/1.1 {code} {text}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = w.flush();
+}
 
 // ---------------------------------------------------------------------------
 // Tests

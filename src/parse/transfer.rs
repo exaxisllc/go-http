@@ -24,6 +24,8 @@ pub enum Body {
     Unbounded(Box<dyn Read + Send>),
     /// No body (HEAD, 204, 304, …).
     Empty,
+    /// Any body wrapped with a hard byte cap; returns an error on overflow.
+    Capped { inner: Box<Body>, remaining: u64 },
 }
 
 impl Read for Body {
@@ -33,6 +35,22 @@ impl Read for Body {
             Self::Chunked(r)   => r.read(buf),
             Self::Unbounded(r) => r.read(buf),
             Self::Empty        => Ok(0),
+            Self::Capped { inner, remaining } => {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                if *remaining > 0 {
+                    let max = buf.len().min(*remaining as usize);
+                    let n = inner.read(&mut buf[..max])?;
+                    *remaining -= n as u64;
+                    return Ok(n);
+                }
+                // Cap is exhausted: check whether inner has naturally ended.
+                match inner.read(&mut buf[..1])? {
+                    0 => Ok(0),
+                    _ => Err(io::Error::other("request body too large")),
+                }
+            }
         }
     }
 }
@@ -49,6 +67,32 @@ impl Body {
         let mut buf = Vec::new();
         self.read_to_end(&mut buf)?;
         Ok(buf)
+    }
+
+    /// Wrap this body with a hard byte cap.  Reads beyond `limit` bytes return
+    /// an `io::Error` rather than silently truncating.
+    pub fn capped(self, limit: u64) -> Self {
+        Body::Capped { inner: Box::new(self), remaining: limit }
+    }
+
+    /// Return trailer headers if this is a chunked body that has been fully
+    /// read.  Returns an empty header for all other body types.
+    pub fn trailers(&self) -> &Header {
+        static EMPTY: std::sync::OnceLock<Header> = std::sync::OnceLock::new();
+        match self {
+            Self::Chunked(r)              => &r.trailers,
+            Self::Capped { inner, .. }    => inner.trailers(),
+            _                             => EMPTY.get_or_init(Header::new),
+        }
+    }
+
+    /// Consume the body and return any trailer headers (chunked bodies only).
+    pub fn into_trailers(self) -> Header {
+        match self {
+            Self::Chunked(r)           => r.trailers,
+            Self::Capped { inner, .. } => inner.into_trailers(),
+            _                          => Header::new(),
+        }
     }
 }
 

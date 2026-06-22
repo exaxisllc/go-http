@@ -15,6 +15,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use go_lib::net::TcpStream;
 use go_http::{
     client::Client,
     cookie::{Cookie, MemoryCookieJar},
@@ -43,6 +44,24 @@ fn start_server_goroutine(addr: String, mux: Arc<ServeMux>) {
     });
     // Give the server goroutine time to bind the listener.
     go_lib::sleep(Duration::from_millis(50));
+}
+
+/// Spawn a configured Server (allows non-default settings like max_body_bytes).
+fn start_configured_server(addr: String, srv: Server) {
+    go_lib::go!(move || {
+        let _ = srv.listen_and_serve();
+    });
+    go_lib::sleep(Duration::from_millis(50));
+}
+
+/// Write raw bytes to a TCP connection and read the full response.
+fn raw_round_trip(addr: &str, request_bytes: &[u8]) -> Vec<u8> {
+    use std::io::{Read, Write};
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream.write_all(request_bytes).expect("write");
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).expect("read");
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -395,4 +414,166 @@ fn post_form_urlencoded() {
         resp.header.get("X-Got-Content-Type").unwrap_or("").contains("urlencoded"),
         "wrong Content-Type echoed"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 14. Expect: 100-continue — server sends provisional response
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn expect_100_continue() {
+    let port = next_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mux = Arc::new(ServeMux::new());
+    mux.handle_func("/upload", |w, r| {
+        let data = r.body_bytes().unwrap_or_default();
+        let _ = w.write(&data);
+    });
+    start_server_goroutine(addr.clone(), mux);
+
+    // Send Expect: 100-continue manually so we can verify the handshake.
+    // The client sends headers first, waits for 100, then sends the body.
+    use std::io::{BufRead, BufReader, Write};
+    let mut stream = TcpStream::connect(&addr as &str).expect("connect");
+
+    // Step 1: send headers only.
+    let body = b"hello from client";
+    write!(
+        stream,
+        "POST /upload HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {}\r\nExpect: 100-continue\r\n\r\n",
+        body.len()
+    ).unwrap();
+    stream.flush().unwrap();
+
+    // Step 2: read the 100 Continue response.
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(
+        line.starts_with("HTTP/1.1 100"),
+        "expected 100 Continue, got: {line:?}"
+    );
+    // Drain the blank line after 100.
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+
+    // Step 3: send the body.
+    stream.write_all(body).unwrap();
+    stream.flush().unwrap();
+
+    // Step 4: read the final response.
+    let mut resp_line = String::new();
+    reader.read_line(&mut resp_line).unwrap();
+    assert!(
+        resp_line.starts_with("HTTP/1.1 200"),
+        "expected 200 OK after body, got: {resp_line:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 15. Expect: unknown value → 417 Expectation Failed
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn expect_unknown_gets_417() {
+    let port = next_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mux = Arc::new(ServeMux::new());
+    mux.handle_func("/", |w, _r| { let _ = w.write(b"ok"); });
+    start_server_goroutine(addr.clone(), mux);
+
+    let raw = format!(
+        "POST / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 4\r\nExpect: bogus-extension\r\n\r\n"
+    );
+    let resp = raw_round_trip(&addr, raw.as_bytes());
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.starts_with("HTTP/1.1 417"),
+        "expected 417, got: {resp_str:.80}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 16. Body size limit — oversized Content-Length → 413
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn body_size_limit_413() {
+    let port = next_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mux = Arc::new(ServeMux::new());
+    mux.handle_func("/upload", |w, _r| { let _ = w.write(b"ok"); });
+
+    let mut srv = Server::new(addr.clone());
+    srv.handler      = Some(mux);
+    srv.max_body_bytes = Some(16);
+    start_configured_server(addr.clone(), srv);
+
+    // Declare a Content-Length larger than the cap.  The server rejects purely
+    // from the header value — no body bytes need to arrive.
+    let raw = format!(
+        "POST /upload HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 64\r\n\r\n"
+    );
+    let resp = raw_round_trip(&addr, raw.as_bytes());
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.starts_with("HTTP/1.1 413"),
+        "expected 413, got: {resp_str:.80}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 17. Chunked trailer headers round-trip
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn chunked_trailers_roundtrip() {
+    let port = next_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mux = Arc::new(ServeMux::new());
+    mux.handle_func("/upload", |w, r| {
+        let _ = r.body_bytes(); // read body, which also harvests trailers
+        let checksum = r.trailers().get("X-Checksum").unwrap_or("missing").to_owned();
+        w.header().set("X-Got-Checksum", &checksum);
+        let _ = w.write(b"ok");
+    });
+    start_server_goroutine(addr.clone(), mux);
+
+    // Send a chunked request with a trailer.
+    // Trailer must be declared in the Trailer header before the body.
+    use std::io::{BufRead, BufReader};
+    let raw = format!(
+        "POST /upload HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nTransfer-Encoding: chunked\r\nTrailer: X-Checksum\r\n\r\n5\r\nhello\r\n0\r\nX-Checksum: abc123\r\n\r\n"
+    );
+    let mut stream = TcpStream::connect(&addr as &str).expect("connect");
+    use std::io::Write;
+    stream.write_all(raw.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    drop(stream.try_clone()); // signal no more writes
+
+    // Read until we see the X-Got-Checksum header in the response.
+    let read_stream = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(read_stream);
+    let mut found_checksum = false;
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).unwrap_or(0);
+        if n == 0 { break; }
+        if line.to_ascii_lowercase().starts_with("x-got-checksum:") {
+            let val = line.splitn(2, ':').nth(1).unwrap_or("").trim().to_owned();
+            assert_eq!(val, "abc123", "trailer not echoed correctly: {val:?}");
+            found_checksum = true;
+            break;
+        }
+        if line == "\r\n" { break; }
+    }
+    assert!(found_checksum, "X-Got-Checksum header not found in response");
 }

@@ -13,7 +13,7 @@ use crate::response::ResponseWriter;
 
 /// The core handler interface.  Port of Go's `http.Handler`.
 pub trait Handler: Send + Sync {
-    fn serve_http(&self, w: &mut dyn ResponseWriter, r: &Request);
+    fn serve_http(&self, w: &mut dyn ResponseWriter, r: &mut Request);
 }
 
 // ---------------------------------------------------------------------------
@@ -22,11 +22,11 @@ pub trait Handler: Send + Sync {
 
 /// Adapter that turns a function into a `Handler`.
 /// Port of Go's `http.HandlerFunc`.
-type HandlerFn = Box<dyn Fn(&mut dyn ResponseWriter, &Request) + Send + Sync>;
+type HandlerFn = Box<dyn Fn(&mut dyn ResponseWriter, &mut Request) + Send + Sync>;
 pub struct HandlerFunc(pub HandlerFn);
 
 impl Handler for HandlerFunc {
-    fn serve_http(&self, w: &mut dyn ResponseWriter, r: &Request) {
+    fn serve_http(&self, w: &mut dyn ResponseWriter, r: &mut Request) {
         (self.0)(w, r)
     }
 }
@@ -35,7 +35,7 @@ impl Handler for HandlerFunc {
 /// wrap a mux or other handler in an `Arc` and pass it directly to middleware
 /// functions like `timeout_handler`.
 impl<H: Handler> Handler for Arc<H> {
-    fn serve_http(&self, w: &mut dyn ResponseWriter, r: &Request) {
+    fn serve_http(&self, w: &mut dyn ResponseWriter, r: &mut Request) {
         (**self).serve_http(w, r)
     }
 }
@@ -43,7 +43,7 @@ impl<H: Handler> Handler for Arc<H> {
 /// Convenience constructor.
 pub fn handler_func<F>(f: F) -> HandlerFunc
 where
-    F: Fn(&mut dyn ResponseWriter, &Request) + Send + Sync + 'static,
+    F: Fn(&mut dyn ResponseWriter, &mut Request) + Send + Sync + 'static,
 {
     HandlerFunc(Box::new(f))
 }
@@ -83,7 +83,7 @@ impl ServeMux {
     /// Register a function as a handler.
     pub fn handle_func<F>(&self, pattern: &str, f: F)
     where
-        F: Fn(&mut dyn ResponseWriter, &Request) + Send + Sync + 'static,
+        F: Fn(&mut dyn ResponseWriter, &mut Request) + Send + Sync + 'static,
     {
         self.handle(pattern, handler_func(f));
     }
@@ -124,7 +124,7 @@ impl ServeMux {
 }
 
 impl Handler for ServeMux {
-    fn serve_http(&self, w: &mut dyn ResponseWriter, r: &Request) {
+    fn serve_http(&self, w: &mut dyn ResponseWriter, r: &mut Request) {
         let path = r.url.path();
         match self.match_handler(path) {
             Some(h) => h.serve_http(w, r),
@@ -159,7 +159,7 @@ pub fn handle(pattern: &str, handler: impl Handler + 'static) {
 /// Register a function on the `DefaultServeMux`.  Port of Go's `http.HandleFunc`.
 pub fn handle_func<F>(pattern: &str, f: F)
 where
-    F: Fn(&mut dyn ResponseWriter, &Request) + Send + Sync + 'static,
+    F: Fn(&mut dyn ResponseWriter, &mut Request) + Send + Sync + 'static,
 {
     default_mux().handle_func(pattern, f);
 }
@@ -199,7 +199,7 @@ pub fn strip_prefix(prefix: String, handler: impl Handler + 'static) -> impl Han
                 new_url.set_path(if stripped.is_empty() { "/" } else { stripped });
                 match rebuild_request(r, new_url) {
                     Err(_) => crate::util::error(w, "internal error", 500),
-                    Ok(req) => handler.serve_http(w, &req),
+                    Ok(mut req) => handler.serve_http(w, &mut req),
                 }
             }
         }
@@ -322,7 +322,7 @@ pub fn timeout_handler(
             inner_req.remote_addr = remote;
 
             let mut capture = BodyCapture::default();
-            inner_handler.serve_http(&mut capture, &inner_req);
+            inner_handler.serve_http(&mut capture, &mut inner_req);
             done_tx.send(capture);
         });
 
@@ -431,9 +431,9 @@ mod tests {
     fn exact_match() {
         let mux = ServeMux::new();
         mux.handle_func("/hello", |w, _| { let _ = w.write(b"hi"); });
-        let r = dummy_request("/hello");
+        let mut r = dummy_request("/hello");
         let mut w = RecordingWriter::new();
-        mux.serve_http(&mut w, &r);
+        mux.serve_http(&mut w, &mut r);
         let out = w.bytes();
         assert!(out.windows(2).any(|w| w == b"hi"), "body should contain 'hi'");
     }
@@ -442,9 +442,9 @@ mod tests {
     fn prefix_match() {
         let mux = ServeMux::new();
         mux.handle_func("/static/", |w, _| { let _ = w.write(b"file"); });
-        let r = dummy_request("/static/foo.js");
+        let mut r = dummy_request("/static/foo.js");
         let mut w = RecordingWriter::new();
-        mux.serve_http(&mut w, &r);
+        mux.serve_http(&mut w, &mut r);
         let out = w.bytes();
         assert!(out.windows(4).any(|s| s == b"file"));
     }
@@ -452,9 +452,9 @@ mod tests {
     #[test]
     fn not_found_fallback() {
         let mux = ServeMux::new();
-        let r = dummy_request("/nowhere");
+        let mut r = dummy_request("/nowhere");
         let mut w = RecordingWriter::new();
-        mux.serve_http(&mut w, &r);
+        mux.serve_http(&mut w, &mut r);
         let out = String::from_utf8(w.bytes()).unwrap();
         assert!(out.contains("404"));
     }
@@ -464,9 +464,9 @@ mod tests {
         let mux = ServeMux::new();
         mux.handle_func("/api/", |w, _| { let _ = w.write(b"short"); });
         mux.handle_func("/api/v2/", |w, _| { let _ = w.write(b"long"); });
-        let r = dummy_request("/api/v2/users");
+        let mut r = dummy_request("/api/v2/users");
         let mut w = RecordingWriter::new();
-        mux.serve_http(&mut w, &r);
+        mux.serve_http(&mut w, &mut r);
         let out = w.bytes();
         assert!(out.windows(4).any(|s| s == b"long"));
     }
@@ -480,9 +480,9 @@ mod tests {
             let _ = w.write(r.url.path().as_bytes());
         });
         let h = strip_prefix("/api".to_owned(), inner);
-        let r = dummy_request("/api/users");
+        let mut r = dummy_request("/api/users");
         let mut w = RecordingWriter::new();
-        h.serve_http(&mut w, &r);
+        h.serve_http(&mut w, &mut r);
         let body = String::from_utf8(w.bytes()).unwrap();
         // The body is the raw bytes written; find /users in them.
         assert!(body.contains("/users"), "stripped path should be /users, got: {body:?}");
@@ -492,9 +492,9 @@ mod tests {
     fn strip_prefix_no_match_returns_404() {
         let inner = handler_func(|w, _| { let _ = w.write(b"ok"); });
         let h = strip_prefix("/api".to_owned(), inner);
-        let r = dummy_request("/other/path");
+        let mut r = dummy_request("/other/path");
         let mut w = RecordingWriter::new();
-        h.serve_http(&mut w, &r);
+        h.serve_http(&mut w, &mut r);
         let out = String::from_utf8(w.bytes()).unwrap();
         assert!(out.contains("404"));
     }
@@ -509,9 +509,9 @@ mod tests {
         std::fs::write(&path, b"hello file").unwrap();
 
         let h = file_server(dir.to_str().unwrap().to_owned());
-        let r = dummy_request("/go_http_test_file.txt");
+        let mut r = dummy_request("/go_http_test_file.txt");
         let mut w = RecordingWriter::new();
-        h.serve_http(&mut w, &r);
+        h.serve_http(&mut w, &mut r);
         let out = w.bytes();
         assert!(out.windows(10).any(|s| s == b"hello file"), "file content not found");
 
@@ -522,9 +522,9 @@ mod tests {
     fn file_server_missing_file_returns_404() {
         let dir = std::env::temp_dir();
         let h = file_server(dir.to_str().unwrap().to_owned());
-        let r = dummy_request("/this_file_does_not_exist_xyz.bin");
+        let mut r = dummy_request("/this_file_does_not_exist_xyz.bin");
         let mut w = RecordingWriter::new();
-        h.serve_http(&mut w, &r);
+        h.serve_http(&mut w, &mut r);
         let out = String::from_utf8(w.bytes()).unwrap();
         assert!(out.contains("404"), "expected 404 in response, got: {}", out);
     }
@@ -543,9 +543,9 @@ mod tests {
         // We serve from .../go_http_test_root/ and request ../go_http_outside.txt
         // which on the filesystem becomes .../go_http_outside.txt (outside root).
         let h = file_server(root.to_str().unwrap().to_owned());
-        let r = dummy_request("/../go_http_outside.txt");
+        let mut r = dummy_request("/../go_http_outside.txt");
         let mut w = RecordingWriter::new();
-        h.serve_http(&mut w, &r);
+        h.serve_http(&mut w, &mut r);
         let out = String::from_utf8(w.bytes()).unwrap();
 
         let _ = std::fs::remove_file(outside);
