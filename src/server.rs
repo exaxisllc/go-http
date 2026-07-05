@@ -254,11 +254,13 @@ fn serve_conn(
         Err(_) => return,
     };
 
-    // Raw fd used by the idle-timeout watchdog to interrupt read_request().
-    // The fd remains valid for the lifetime of `stream`; the watchdog takes
-    // a non-owning view via from_raw_fd + forget.
+    // Raw fd/socket used by the idle-timeout watchdog to interrupt read_request().
+    // The handle remains valid for the lifetime of `stream`; the watchdog takes
+    // a non-owning view via from_raw_fd/from_raw_socket + forget.
     #[cfg(unix)]
     let raw_fd = stream.as_raw_fd();
+    #[cfg(windows)]
+    let raw_socket = stream.as_raw_socket() as u64;
 
     loop {
         // ── Idle timeout watchdog ─────────────────────────────────────────────
@@ -275,9 +277,15 @@ fn serve_conn(
                     recv(ctx.done())     -> _sig => {
                         #[cfg(unix)] {
                             use std::os::unix::io::FromRawFd;
-                            // SAFETY: raw_fd is valid while stream is alive; we forget
-                            // the TcpStream wrapper immediately so the fd is not closed.
+                            // SAFETY: raw_fd is valid while stream is alive; forget
+                            // prevents double-close since from_raw_fd takes ownership.
                             let s = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
+                            let _ = s.shutdown(std::net::Shutdown::Read);
+                            std::mem::forget(s);
+                        }
+                        #[cfg(windows)] {
+                            use std::os::windows::io::FromRawSocket;
+                            let s = unsafe { std::net::TcpStream::from_raw_socket(raw_socket) };
                             let _ = s.shutdown(std::net::Shutdown::Read);
                             std::mem::forget(s);
                         }
@@ -418,9 +426,11 @@ fn serve_conn_tls(
         .map(|a| a.to_string())
         .unwrap_or_default();
 
-    // Capture raw fd before moving stream into StreamOwned.
+    // Capture raw fd/socket before moving stream into StreamOwned.
     #[cfg(unix)]
     let raw_fd = stream.as_raw_fd();
+    #[cfg(windows)]
+    let raw_socket = stream.as_raw_socket() as u64;
 
     let server_conn = match ServerConnection::new(tls_config) {
         Ok(c)  => c,
@@ -441,6 +451,12 @@ fn serve_conn_tls(
                         #[cfg(unix)] {
                             use std::os::unix::io::FromRawFd;
                             let s = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
+                            let _ = s.shutdown(std::net::Shutdown::Read);
+                            std::mem::forget(s);
+                        }
+                        #[cfg(windows)] {
+                            use std::os::windows::io::FromRawSocket;
+                            let s = unsafe { std::net::TcpStream::from_raw_socket(raw_socket) };
                             let _ = s.shutdown(std::net::Shutdown::Read);
                             std::mem::forget(s);
                         }

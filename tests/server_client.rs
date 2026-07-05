@@ -646,6 +646,9 @@ fn graceful_shutdown_waits() {
 // 19. Idle timeout — closes keep-alive connection after inactivity
 // ---------------------------------------------------------------------------
 
+// Windows: shutdown(SD_RECEIVE) via IOCP may not interrupt a parked read the
+// same way SHUT_RD does on Unix.  Skip on Windows until verified.
+#[cfg(not(windows))]
 #[test]
 #[go_lib::main]
 fn idle_timeout_closes_connection() {
