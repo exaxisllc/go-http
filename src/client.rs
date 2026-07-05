@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use go_lib::context::{with_timeout, CancelFn, Context};
+use go_lib::context::{with_timeout, Context};
 use go_lib::net::TcpStream;
 use url::Url;
 
@@ -37,6 +37,10 @@ struct IdleConn {
     stream: TcpStream,
 }
 
+/// Resolves the proxy to use for a request, or `None` for a direct connection.
+/// Port of Go's `Transport.Proxy func(*Request) (*url.URL, error)`.
+pub type ProxyFn = Arc<dyn Fn(&Request) -> Result<Option<Url>, HttpError> + Send + Sync>;
+
 /// Default `RoundTripper` with per-host idle connection pooling.
 /// Port of Go's `http.Transport`.
 pub struct Transport {
@@ -46,7 +50,10 @@ pub struct Transport {
     /// TLS client configuration for HTTPS requests.
     /// `None` uses the default Mozilla root store (via `webpki-roots`).
     pub tls_config: Option<Arc<rustls::ClientConfig>>,
-    /// Idle connection pool keyed by `"host:port"`.
+    /// Proxy resolver.  `None` connects directly.  See [`proxy_from_environment`].
+    pub proxy: Option<ProxyFn>,
+    /// Idle connection pool keyed by `"host:port"` (the dial target — the proxy
+    /// when proxying, else the origin).
     pool: Mutex<HashMap<String, VecDeque<IdleConn>>>,
 }
 
@@ -57,6 +64,7 @@ impl Transport {
             idle_conn_timeout:       Some(Duration::from_secs(90)),
             dial_timeout:            Some(Duration::from_secs(30)),
             tls_config:              None,
+            proxy:                   None,
             pool:                    Mutex::new(HashMap::new()),
         }
     }
@@ -96,70 +104,122 @@ impl Default for Transport {
 
 impl RoundTripper for Transport {
     fn round_trip(&self, mut req: Request) -> Result<Response, HttpError> {
-        let scheme    = req.url.scheme();
-        let is_https  = scheme == "https";
-        let host      = req.url.host_str().unwrap_or("localhost");
+        let is_https  = req.url.scheme() == "https";
+        let host      = req.url.host_str().unwrap_or("localhost").to_owned();
         let port      = req.url.port_or_known_default()
             .unwrap_or(if is_https { 443 } else { 80 });
-        let host_port = format!("{host}:{port}");
+        let target_hp = format!("{host}:{port}");
 
-        let stream = self.acquire(&host_port).map_err(HttpError::Io)?;
+        // Resolve the proxy (if any) for this request.
+        let proxy_url = match &self.proxy {
+            Some(f) => f(&req)?,
+            None    => None,
+        };
 
-        if is_https {
-            // ── HTTPS path ────────────────────────────────────────────────────
-            let tls_cfg = match &self.tls_config {
-                Some(c) => Arc::clone(c),
-                None    => crate::tls::default_client_config(),
-            };
-            let server_name = rustls::pki_types::ServerName::try_from(host.to_owned())
-                .map_err(|e| HttpError::Tls(e.to_string()))?;
-            let client_conn = rustls::ClientConnection::new(tls_cfg, server_name)
-                .map_err(|e| HttpError::Tls(e.to_string()))?;
-            let mut tls = rustls::StreamOwned::new(client_conn, stream);
-
-            send_request(&mut tls, &mut req)?;
-
-            // Lend `tls` to the response parser via a raw-pointer read wrapper.
-            // Safety: `tls` outlives the parser and the response body within this
-            // call frame; there is no concurrent access.
-            let read_ptr: *mut dyn Read = &mut tls as &mut dyn Read as *mut dyn Read;
-            let parsed = read_response(
-                RawRead(read_ptr),
-                Some(req.method.as_str()),
-                crate::parse::request::DEFAULT_MAX_HEADER_BYTES,
-            )?;
-            // TLS connections are not pooled (no try_clone equivalent).
-            Ok(parsed_response_to_response(parsed))
-        } else {
-            // ── HTTP path ─────────────────────────────────────────────────────
-            let mut stream = stream;
-            send_request(&mut stream, &mut req)?;
-
-            let mut parsed = read_response(
-                stream.try_clone().map_err(HttpError::Io)?,
-                Some(req.method.as_str()),
-                crate::parse::request::DEFAULT_MAX_HEADER_BYTES,
-            )?;
-
-            let keep_alive = is_keep_alive_parsed(&parsed, req.proto_minor);
-
-            // Buffer the body into memory before releasing the stream to the
-            // pool.  The body is backed by a try_clone() of `stream`; if we
-            // release `stream` first and the caller drops the Response without
-            // reading the body, Body::drain() would race against the next
-            // request's reads on the same underlying socket (clone and
-            // original share one kernel file description) → SIGSEGV on
-            // Linux/epoll.  Buffering here fully drains the socket before the
-            // connection is reused, and replaces the network-backed body with
-            // an in-memory Cursor the caller can read freely.
-            if keep_alive {
-                let bytes = parsed.body.read_to_vec().map_err(|_| HttpError::BodyRead)?;
-                parsed.body = Body::Unbounded(Box::new(io::Cursor::new(bytes)));
-                self.release(&host_port, stream);
+        match proxy_url {
+            None => {
+                if is_https {
+                    self.https_round_trip(req, &host, &target_hp, None)
+                } else {
+                    self.http_round_trip(req, &target_hp, false)
+                }
             }
-
-            Ok(parsed_response_to_response(parsed))
+            Some(pu) => {
+                let proxy_hp = proxy_host_port(&pu)?;
+                let auth     = proxy_auth_header(&pu);
+                if is_https {
+                    // Tunnel to the origin through the proxy with CONNECT, then TLS.
+                    self.https_round_trip(req, &host, &target_hp, Some((proxy_hp, auth)))
+                } else {
+                    // Plain HTTP: dial the proxy and send an absolute-form target.
+                    if let Some(a) = auth {
+                        req.header.set("Proxy-Authorization", a);
+                    }
+                    self.http_round_trip(req, &proxy_hp, true)
+                }
+            }
         }
+    }
+}
+
+impl Transport {
+    /// Plain-HTTP round-trip.  `dial_hp` is the address to connect to (the
+    /// proxy when proxying, else the origin); `absolute` selects absolute-form
+    /// request-target framing for proxied requests.
+    fn http_round_trip(
+        &self,
+        mut req: Request,
+        dial_hp: &str,
+        absolute: bool,
+    ) -> Result<Response, HttpError> {
+        let mut stream = self.acquire(dial_hp).map_err(HttpError::Io)?;
+        send_request(&mut stream, &mut req, absolute)?;
+
+        let mut parsed = read_response(
+            stream.try_clone().map_err(HttpError::Io)?,
+            Some(req.method.as_str()),
+            crate::parse::request::DEFAULT_MAX_HEADER_BYTES,
+        )?;
+
+        let keep_alive = is_keep_alive_parsed(&parsed, req.proto_minor);
+
+        // Buffer the body into memory before releasing the stream to the pool.
+        // The body is backed by a try_clone() of `stream`; releasing `stream`
+        // while an unread network-backed body alias is live would race the next
+        // request's reads on the same socket.  Buffering fully drains the socket
+        // first and replaces the body with an in-memory Cursor.
+        if keep_alive {
+            let bytes = parsed.body.read_to_vec().map_err(|_| HttpError::BodyRead)?;
+            parsed.body = Body::Unbounded(Box::new(io::Cursor::new(bytes)));
+            self.release(dial_hp, stream);
+        }
+
+        Ok(parsed_response_to_response(parsed))
+    }
+
+    /// HTTPS round-trip.  When `proxy` is `Some((proxy_hp, auth))`, a `CONNECT`
+    /// tunnel to `target_hp` is established through the proxy first; otherwise
+    /// `target_hp` is dialled directly.  TLS is then negotiated using `sni_host`.
+    /// TLS connections are not pooled.
+    fn https_round_trip(
+        &self,
+        mut req: Request,
+        sni_host: &str,
+        target_hp: &str,
+        proxy: Option<(String, Option<String>)>,
+    ) -> Result<Response, HttpError> {
+        let stream = match proxy {
+            Some((proxy_hp, auth)) => {
+                let mut s = TcpStream::connect(proxy_hp.as_str()).map_err(HttpError::Io)?;
+                connect_tunnel(&mut s, target_hp, auth.as_deref())?;
+                s
+            }
+            None => TcpStream::connect(target_hp).map_err(HttpError::Io)?,
+        };
+
+        let tls_cfg = match &self.tls_config {
+            Some(c) => Arc::clone(c),
+            None    => crate::tls::default_client_config(),
+        };
+        let server_name = rustls::pki_types::ServerName::try_from(sni_host.to_owned())
+            .map_err(|e| HttpError::Tls(e.to_string()))?;
+        let client_conn = rustls::ClientConnection::new(tls_cfg, server_name)
+            .map_err(|e| HttpError::Tls(e.to_string()))?;
+        let mut tls = rustls::StreamOwned::new(client_conn, stream);
+
+        // Origin-form over the (possibly tunnelled) TLS connection.
+        send_request(&mut tls, &mut req, false)?;
+
+        // Lend `tls` to the response parser via a raw-pointer read wrapper.
+        // Safety: `tls` outlives the parser and the response body within this
+        // call frame; there is no concurrent access.
+        let read_ptr: *mut dyn Read = &mut tls as &mut dyn Read as *mut dyn Read;
+        let parsed = read_response(
+            RawRead(read_ptr),
+            Some(req.method.as_str()),
+            crate::parse::request::DEFAULT_MAX_HEADER_BYTES,
+        )?;
+        Ok(parsed_response_to_response(parsed))
     }
 }
 
@@ -182,6 +242,29 @@ impl Read for RawRead {
 }
 
 // ---------------------------------------------------------------------------
+// Redirect policy — port of Go's Client.CheckRedirect
+// ---------------------------------------------------------------------------
+
+/// What a [`CheckRedirect`] policy decides for the next hop.
+pub enum RedirectPolicy {
+    /// Follow the redirect (subject to the same policy on the following hop).
+    Follow,
+    /// Stop and return the most recent response as-is, without following.
+    /// Equivalent to returning Go's `ErrUseLastResponse`.
+    UseLastResponse,
+}
+
+/// A redirect policy.  Called before each redirect is followed, with the
+/// request about to be made and `via`, the chain of requests already made
+/// (oldest first).  Return [`RedirectPolicy::Follow`] to continue,
+/// [`RedirectPolicy::UseLastResponse`] to stop and return the last response,
+/// or an `Err` to abort the request with that error.
+///
+/// Port of Go's `Client.CheckRedirect func(req *Request, via []*Request) error`.
+pub type CheckRedirect =
+    Arc<dyn Fn(&Request, &[Request]) -> Result<RedirectPolicy, HttpError> + Send + Sync>;
+
+// ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
 
@@ -191,8 +274,12 @@ pub struct Client {
     pub transport:    Arc<dyn RoundTripper>,
     /// Per-request timeout; `None` means no timeout.
     pub timeout:      Option<Duration>,
-    /// Maximum number of redirects to follow (default 10, matching Go).
+    /// Maximum number of redirects to follow when `check_redirect` is `None`
+    /// (default 10, matching Go).
     pub max_redirects: usize,
+    /// Custom redirect policy.  `None` uses the default (follow up to
+    /// `max_redirects`, then fail with [`HttpError::TooManyRedirects`]).
+    pub check_redirect: Option<CheckRedirect>,
     /// Optional cookie jar.
     pub jar: Option<Arc<dyn CookieJar>>,
 }
@@ -201,10 +288,11 @@ impl Client {
     /// Create a client using the default `Transport`.
     pub fn new() -> Self {
         Self {
-            transport:     Arc::new(Transport::new()),
-            timeout:       None,
-            max_redirects: 10,
-            jar:           None,
+            transport:      Arc::new(Transport::new()),
+            timeout:        None,
+            max_redirects:  10,
+            check_redirect: None,
+            jar:            None,
         }
     }
 
@@ -252,22 +340,37 @@ impl Client {
     /// Execute `req`, following redirects and attaching cookies.
     /// Port of Go's `(*Client).Do`.
     pub fn do_request(&self, req: Request) -> Result<Response, HttpError> {
-        // Wrap in a context deadline if a timeout is configured.
-        let (_cancel, ctx_req) = apply_timeout(&req, self.timeout);
-        let mut req = if let Some(ctx) = ctx_req { req.with_context(ctx) } else { req };
+        // Effective cancellation context governing *every* redirect hop: the
+        // request's own context (which may already carry a per-request
+        // deadline via `Request::new_with_context`) with the client-wide
+        // `timeout` applied on top.  `_cancel` must stay alive for the whole
+        // call so the deadline timer is not released early.
+        let (_cancel, ctx) = match self.timeout {
+            Some(d) => {
+                let (c, cancel) = with_timeout(req.context(), d);
+                (Some(cancel), c)
+            }
+            None => (None, req.context().clone()),
+        };
+
+        let mut req = req;
 
         // Attach cookies from the jar for the initial URL.
         if let Some(jar) = &self.jar {
             attach_cookies(&mut req, jar.as_ref());
         }
 
-        let mut redirects = 0usize;
+        // `via` records the requests already made (oldest first), as Go passes
+        // to CheckRedirect.  Entries are body-less snapshots.
+        let mut via: Vec<Request> = Vec::new();
 
         loop {
             let method = req.method.clone();
             let url    = req.url.clone();
+            let via_entry = snapshot_request(&req);
 
-            let mut resp = self.transport.round_trip(req)?;
+            let mut resp = self.execute_round_trip(req, &ctx)?;
+            via.push(via_entry);
 
             // Store cookies from the response.
             if let Some(jar) = &self.jar {
@@ -280,21 +383,13 @@ impl Client {
                 return Ok(resp);
             }
 
-            if redirects >= self.max_redirects {
-                return Err(HttpError::TooManyRedirects);
-            }
-            redirects += 1;
-
             let location = resp
                 .header
                 .get("Location")
                 .ok_or_else(|| HttpError::InvalidUrl("redirect with no Location".into()))?
                 .to_owned();
 
-            // Drain the redirect body so the connection can be reused.
-            let _ = resp.body_bytes();
-
-            // Resolve the redirect URL against the original.
+            // Resolve the redirect URL against the current one.
             let new_url = resolve_url(&url, &location)?;
 
             // POST → GET on 301/302/303 (matching Go semantics).
@@ -305,17 +400,63 @@ impl Client {
                 _ => method,
             };
 
-            let body = None; // body consumed; caller must handle 307/308 with body separately
-
-            let mut new_req = Request::new(&new_method, new_url.as_str(), body)?;
+            // Body is consumed; 307/308 with a body would need a rewindable
+            // body to replay (not yet supported).
+            let mut new_req = Request::new(&new_method, new_url.as_str(), None)?;
             // Forward safe headers; strip Authorization on cross-origin redirects.
             forward_headers(&mut new_req.header, &resp.header, same_origin(&url, &new_url));
-
             if let Some(jar) = &self.jar {
                 attach_cookies(&mut new_req, jar.as_ref());
             }
 
+            // ── Apply the redirect policy ──────────────────────────────────
+            match &self.check_redirect {
+                Some(policy) => match policy(&new_req, &via)? {
+                    RedirectPolicy::Follow => {}
+                    RedirectPolicy::UseLastResponse => return Ok(resp),
+                },
+                None => {
+                    if via.len() > self.max_redirects {
+                        return Err(HttpError::TooManyRedirects);
+                    }
+                }
+            }
+
+            // Drain the redirect body so the connection can be reused.
+            let _ = resp.body_bytes();
+
             req = new_req;
+        }
+    }
+
+    /// Execute one round-trip, honouring the cancellation `ctx`.
+    ///
+    /// When `ctx` carries a deadline the round-trip runs on its own goroutine
+    /// and is raced against `ctx.done()`, so a timeout or cancellation returns
+    /// promptly with [`HttpError::Timeout`] even while the underlying socket
+    /// I/O is still blocked.  (The abandoned goroutine finishes on its own when
+    /// the I/O completes or errors; like Go, we can't forcibly unwind it.)
+    /// Without a deadline the round-trip runs synchronously — no extra goroutine.
+    fn execute_round_trip(&self, req: Request, ctx: &Context) -> Result<Response, HttpError> {
+        if ctx.deadline().is_none() {
+            return self.transport.round_trip(req);
+        }
+        if ctx.is_done() {
+            return Err(HttpError::Timeout);
+        }
+
+        let (tx, rx) = go_lib::chan::chan::<Result<Response, HttpError>>(1);
+        let transport = Arc::clone(&self.transport);
+        go_lib::go!(move || {
+            let result = transport.round_trip(req);
+            // Buffered(1): the send never blocks.  If the receiver already
+            // timed out and is gone, catch_unwind swallows any panic.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tx.send(result)));
+        });
+
+        go_lib::select! {
+            recv(ctx.done()) -> _sig => { Err(HttpError::Timeout) }
+            recv(rx) -> result => { result.unwrap_or_else(|| Err(HttpError::Timeout)) }
         }
     }
 }
@@ -361,9 +502,15 @@ pub fn head(url: &str) -> Result<Response, HttpError> {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Serialize a `Request` (headers + body) to `w`.
-fn send_request(w: &mut impl Write, req: &mut Request) -> Result<(), HttpError> {
-    req.write_header_to(w)?;
+/// Serialize a `Request` (headers + body) to `w`.  `absolute` selects
+/// absolute-form request-target framing (`GET http://host/path`) for requests
+/// sent to an HTTP proxy.
+fn send_request(w: &mut impl Write, req: &mut Request, absolute: bool) -> Result<(), HttpError> {
+    if absolute {
+        req.write_header_absolute_to(w)?;
+    } else {
+        req.write_header_to(w)?;
+    }
     // Write body bytes if present (POST/PUT/PATCH).
     if let Some(body) = req.body.take() {
         use std::io::Read;
@@ -402,6 +549,163 @@ fn parsed_response_to_response(p: ParsedResponse) -> Response {
         transfer_encoding: p.transfer_encoding,
         trailer:           Header::new(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Proxy helpers
+// ---------------------------------------------------------------------------
+
+/// A [`ProxyFn`] that reads the standard proxy environment variables, mirroring
+/// Go's `http.ProxyFromEnvironment`:
+///
+/// - `HTTPS_PROXY` / `https_proxy` for `https://` requests,
+/// - `HTTP_PROXY`  / `http_proxy`  for `http://`  requests,
+/// - `NO_PROXY`    / `no_proxy`    a comma-separated exclusion list.
+///
+/// `NO_PROXY` entries match by exact host, by `.suffix` (any sub-domain), or
+/// `*` (everything).  The environment is read on each call.  A bare
+/// `host:port` proxy value is treated as an `http://` URL.
+pub fn proxy_from_environment() -> ProxyFn {
+    Arc::new(|req: &Request| -> Result<Option<Url>, HttpError> {
+        let is_https = req.url.scheme() == "https";
+        let host     = req.url.host_str().unwrap_or("");
+
+        // NO_PROXY exclusions.
+        if let Some(no) = env_first(&["NO_PROXY", "no_proxy"])
+            && host_matches_no_proxy(host, &no)
+        {
+            return Ok(None);
+        }
+
+        let names: &[&str] = if is_https {
+            &["HTTPS_PROXY", "https_proxy"]
+        } else {
+            &["HTTP_PROXY", "http_proxy"]
+        };
+        match env_first(names) {
+            None => Ok(None),
+            Some(v) if v.trim().is_empty() => Ok(None),
+            Some(v) => {
+                let raw = v.trim();
+                // Accept bare "host:port" by defaulting to an http:// scheme.
+                let normalized = if raw.contains("://") {
+                    raw.to_owned()
+                } else {
+                    format!("http://{raw}")
+                };
+                let url = Url::parse(&normalized)
+                    .map_err(|e| HttpError::Proxy(format!("bad proxy URL {raw:?}: {e}")))?;
+                Ok(Some(url))
+            }
+        }
+    })
+}
+
+/// Return the first set, non-empty environment variable among `names`.
+fn env_first(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|n| std::env::var(n).ok())
+}
+
+/// Match `host` against a `NO_PROXY` list (comma-separated).
+fn host_matches_no_proxy(host: &str, no_proxy: &str) -> bool {
+    let host = host.trim_start_matches('.').to_ascii_lowercase();
+    for entry in no_proxy.split(',') {
+        let e = entry.trim().to_ascii_lowercase();
+        if e.is_empty() {
+            continue;
+        }
+        if e == "*" {
+            return true;
+        }
+        let suffix = e.trim_start_matches('.');
+        if host == suffix || host.ends_with(&format!(".{suffix}")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `host:port` to dial for a proxy URL (default port 80).
+fn proxy_host_port(pu: &Url) -> Result<String, HttpError> {
+    let h = pu
+        .host_str()
+        .ok_or_else(|| HttpError::Proxy("proxy URL has no host".into()))?;
+    let p = pu.port_or_known_default().unwrap_or(80);
+    Ok(format!("{h}:{p}"))
+}
+
+/// Build a `Basic` `Proxy-Authorization` value from a proxy URL's userinfo,
+/// or `None` when there is no username.
+fn proxy_auth_header(pu: &Url) -> Option<String> {
+    let user = pu.username();
+    if user.is_empty() {
+        return None;
+    }
+    let pass  = pu.password().unwrap_or("");
+    let creds = format!("{user}:{pass}");
+    let b64   = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, creds);
+    Some(format!("Basic {b64}"))
+}
+
+/// Establish an HTTP `CONNECT` tunnel through a proxy to `target_hp`.
+/// On success the stream is positioned to begin the TLS handshake.
+fn connect_tunnel<S: Read + Write>(
+    stream: &mut S,
+    target_hp: &str,
+    auth: Option<&str>,
+) -> Result<(), HttpError> {
+    let mut req = format!("CONNECT {target_hp} HTTP/1.1\r\nHost: {target_hp}\r\n");
+    if let Some(a) = auth {
+        req.push_str(&format!("Proxy-Authorization: {a}\r\n"));
+    }
+    req.push_str("\r\n");
+    stream.write_all(req.as_bytes()).map_err(HttpError::Io)?;
+
+    let status = read_connect_response(stream)?;
+    if !(200..300).contains(&status) {
+        return Err(HttpError::Proxy(format!(
+            "CONNECT to {target_hp} failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Read a proxy `CONNECT` response (status line + headers, no body) and return
+/// its status code.
+fn read_connect_response<R: Read>(stream: &mut R) -> Result<u16, HttpError> {
+    let mut buf  = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte).map_err(HttpError::Io)?;
+        if n == 0 {
+            return Err(HttpError::Proxy("proxy closed before CONNECT response".into()));
+        }
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > 8192 {
+            return Err(HttpError::Proxy("CONNECT response headers too large".into()));
+        }
+    }
+    let text  = String::from_utf8_lossy(&buf);
+    let first = text.lines().next().unwrap_or("");
+    first
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| HttpError::Proxy(format!("malformed CONNECT status line: {first:?}")))
+}
+
+/// Build a body-less snapshot of `r` for the redirect `via` chain (method,
+/// URL, headers, host).  Infallible: `r` already holds a valid method + URL.
+fn snapshot_request(r: &Request) -> Request {
+    let mut s = Request::new(&r.method, r.url.as_str(), None)
+        .unwrap_or_else(|_| Request::new("GET", "http://invalid.invalid/", None).unwrap());
+    s.header = r.header.clone();
+    s.host   = r.host.clone();
+    s.proto  = r.proto.clone();
+    s
 }
 
 /// Copy safe headers from `src` into `dst`; strip Authorization on
@@ -476,18 +780,6 @@ fn store_cookies(url: &Url, header: &Header, jar: &dyn CookieJar) {
         .collect();
     if !cookies.is_empty() {
         jar.set_cookies(url, &cookies);
-    }
-}
-
-/// Wrap the request's context with a deadline if `timeout` is set.
-/// Returns the CancelFn (must be kept alive) and optionally a new Context.
-fn apply_timeout(req: &Request, timeout: Option<Duration>) -> (Option<CancelFn>, Option<Context>) {
-    match timeout {
-        None => (None, None),
-        Some(d) => {
-            let (ctx, cancel) = with_timeout(req.context(), d);
-            (Some(cancel), Some(ctx))
-        }
     }
 }
 
@@ -587,4 +879,93 @@ mod tests {
     // tests (get_basic, multiple_sequential_requests, etc.), which carry
     // `#[go_lib::main]` so each test body runs as the first goroutine on the
     // shared process-wide scheduler.
+
+    // ── Proxy helpers ──────────────────────────────────────────────────────
+
+    #[test]
+    fn proxy_auth_header_from_userinfo() {
+        use base64::Engine;
+        let with = Url::parse("http://user:pass@proxy.local:3128").unwrap();
+        let expected = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("user:pass")
+        );
+        assert_eq!(proxy_auth_header(&with), Some(expected));
+
+        let without = Url::parse("http://proxy.local:3128").unwrap();
+        assert_eq!(proxy_auth_header(&without), None);
+    }
+
+    #[test]
+    fn proxy_host_port_defaults_port_80() {
+        let u = Url::parse("http://proxy.local").unwrap();
+        assert_eq!(proxy_host_port(&u).unwrap(), "proxy.local:80");
+        let u2 = Url::parse("http://proxy.local:8080").unwrap();
+        assert_eq!(proxy_host_port(&u2).unwrap(), "proxy.local:8080");
+    }
+
+    #[test]
+    fn no_proxy_matching() {
+        assert!(host_matches_no_proxy("example.com", "example.com"));
+        assert!(host_matches_no_proxy("api.example.com", ".example.com"));
+        assert!(host_matches_no_proxy("api.example.com", "example.com"));
+        assert!(host_matches_no_proxy("anything", "*"));
+        assert!(host_matches_no_proxy("b.internal", "foo.com, .internal"));
+        assert!(!host_matches_no_proxy("example.org", "example.com"));
+        assert!(!host_matches_no_proxy("notexample.com", ".example.com"));
+    }
+
+    #[test]
+    fn connect_response_parsing() {
+        use std::io::Cursor;
+        let mut ok = Cursor::new(b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec());
+        assert_eq!(read_connect_response(&mut ok).unwrap(), 200);
+
+        let mut denied = Cursor::new(b"HTTP/1.1 407 Proxy Auth Required\r\n\r\n".to_vec());
+        assert_eq!(read_connect_response(&mut denied).unwrap(), 407);
+    }
+
+    /// In-memory Read+Write used to exercise `connect_tunnel` without a socket.
+    struct MockConn {
+        to_read: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+    impl Read for MockConn {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.to_read.read(buf)
+        }
+    }
+    impl Write for MockConn {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn connect_tunnel_sends_request_and_accepts_200() {
+        let mut conn = MockConn {
+            to_read: std::io::Cursor::new(b"HTTP/1.1 200 OK\r\n\r\n".to_vec()),
+            written: Vec::new(),
+        };
+        connect_tunnel(&mut conn, "example.com:443", Some("Basic Zm9v")).unwrap();
+        let sent = String::from_utf8(conn.written.clone()).unwrap();
+        assert!(sent.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"), "got: {sent:?}");
+        assert!(sent.contains("Host: example.com:443\r\n"));
+        assert!(sent.contains("Proxy-Authorization: Basic Zm9v\r\n"));
+        assert!(sent.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn connect_tunnel_errors_on_non_2xx() {
+        let mut conn = MockConn {
+            to_read: std::io::Cursor::new(b"HTTP/1.1 403 Forbidden\r\n\r\n".to_vec()),
+            written: Vec::new(),
+        };
+        let err = connect_tunnel(&mut conn, "example.com:443", None).unwrap_err();
+        assert!(matches!(err, HttpError::Proxy(_)), "got: {err:?}");
+    }
 }

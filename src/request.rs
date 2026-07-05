@@ -239,6 +239,31 @@ impl Request {
         w.write_all(b"\r\n")?;
         Ok(())
     }
+
+    /// Like [`write_header_to`][Self::write_header_to] but emits the
+    /// request-target in **absolute-form** (`GET http://host/path HTTP/1.1`),
+    /// as required when sending a request to an HTTP proxy (RFC 7230 §5.3.2).
+    pub fn write_header_absolute_to(&self, w: &mut impl std::io::Write) -> Result<(), HttpError> {
+        write!(w, "{} {} {}\r\n", self.method, self.absolute_target(), self.proto)?;
+        write!(w, "Host: {}\r\n", self.host)?;
+        self.header.write_to(w)?;
+        w.write_all(b"\r\n")?;
+        Ok(())
+    }
+
+    /// Reconstruct the absolute request-target `scheme://host[:port]/path?query`
+    /// (without userinfo or fragment) for proxied requests.
+    fn absolute_target(&self) -> String {
+        let u = &self.url;
+        let authority = match (u.host_str(), u.port()) {
+            (Some(h), Some(p)) => format!("{h}:{p}"),
+            (Some(h), None)    => h.to_owned(),
+            (None, _)          => String::new(),
+        };
+        let path  = if u.path().is_empty() { "/" } else { u.path() };
+        let query = u.query().map(|q| format!("?{q}")).unwrap_or_default();
+        format!("{}://{}{}{}", u.scheme(), authority, path, query)
+    }
 }
 
 // Helper: allow Body to be read via std::io::Read without exposing internals.
