@@ -36,6 +36,9 @@ pub struct Request {
     pub trailer: Header,
     /// Remote address of the client (set by the server, empty on client requests).
     pub remote_addr: String,
+    /// Named path parameters captured by ServeMux wildcard patterns, e.g. `{id}`.
+    /// Populated by `ServeMux::serve_http`; empty for client-side requests.
+    pub path_params: HashMap<String, String>,
     /// Parsed form values (populated by `parse_form`).
     form: Option<HashMap<String, Vec<String>>>,
     /// Cancellation context.
@@ -82,6 +85,7 @@ impl Request {
             host,
             trailer: Header::new(),
             remote_addr: String::new(),
+            path_params: HashMap::new(),
             form: None,
             ctx,
         })
@@ -98,6 +102,15 @@ impl Request {
     pub fn with_context(mut self, ctx: Context) -> Self {
         self.ctx = ctx;
         self
+    }
+
+    // ── Path parameter helpers ────────────────────────────────────────────────
+
+    /// Return the value captured for the named wildcard in the matched ServeMux
+    /// pattern (e.g. `{id}` or `{path...}`).  Returns `""` if the parameter
+    /// was not captured.  Port of Go's `(*Request).PathValue`.
+    pub fn path_value(&self, name: &str) -> &str {
+        self.path_params.get(name).map(String::as_str).unwrap_or("")
     }
 
     // ── Header helpers ────────────────────────────────────────────────────────
