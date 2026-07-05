@@ -17,8 +17,9 @@ use std::time::Duration;
 
 use go_lib::net::TcpStream;
 use go_http::{
-    client::Client,
+    client::{Client, RedirectPolicy},
     cookie::{Cookie, MemoryCookieJar},
+    error::HttpError,
     handler::ServeMux,
     parse::transfer::Body,
     server::Server,
@@ -295,6 +296,94 @@ fn redirect_followed() {
         .expect("GET failed");
     assert_eq!(resp.status, status::OK);
     assert_eq!(resp.body_string().unwrap(), "new location");
+}
+
+// ---------------------------------------------------------------------------
+// 9b. Redirect policy — UseLastResponse stops following
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn redirect_policy_use_last_response() {
+    let port = next_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mux = Arc::new(ServeMux::new());
+    mux.handle_func("/start", |w, r| {
+        go_http::util::redirect(w, r, "/dest", status::FOUND);
+    });
+    mux.handle_func("/dest", |w, _| { let _ = w.write(b"final"); });
+    start_server_goroutine(addr, mux);
+
+    let mut client = Client::new();
+    client.check_redirect = Some(Arc::new(|_next, _via| Ok(RedirectPolicy::UseLastResponse)));
+
+    let resp = client
+        .get(&format!("http://127.0.0.1:{port}/start"))
+        .expect("GET failed");
+    // The 302 is returned as-is; the redirect is not followed.
+    assert_eq!(resp.status, status::FOUND);
+    assert_eq!(resp.header.get("Location").unwrap_or(""), "/dest");
+}
+
+// ---------------------------------------------------------------------------
+// 9c. Redirect policy — returning an error aborts the request
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn redirect_policy_error_aborts() {
+    let port = next_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mux = Arc::new(ServeMux::new());
+    mux.handle_func("/start", |w, r| {
+        go_http::util::redirect(w, r, "/dest", status::FOUND);
+    });
+    mux.handle_func("/dest", |w, _| { let _ = w.write(b"final"); });
+    start_server_goroutine(addr, mux);
+
+    let mut client = Client::new();
+    client.check_redirect =
+        Some(Arc::new(|_next, _via| Err(HttpError::Redirect("blocked by policy".into()))));
+
+    match client.get(&format!("http://127.0.0.1:{port}/start")) {
+        Ok(_)  => panic!("policy should have aborted the request"),
+        Err(e) => assert!(matches!(e, HttpError::Redirect(_)), "got: {e:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 9d. Redirect policy — sees the growing `via` chain
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn redirect_policy_sees_via_chain() {
+    let port = next_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mux = Arc::new(ServeMux::new());
+    mux.handle_func("/a", |w, r| { go_http::util::redirect(w, r, "/b", status::FOUND); });
+    mux.handle_func("/b", |w, r| { go_http::util::redirect(w, r, "/c", status::FOUND); });
+    mux.handle_func("/c", |w, _| { let _ = w.write(b"landed at c"); });
+    start_server_goroutine(addr, mux);
+
+    let seen: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = Arc::clone(&seen);
+
+    let mut client = Client::new();
+    client.check_redirect = Some(Arc::new(move |_next, via| {
+        seen2.lock().unwrap().push(via.len());
+        Ok(RedirectPolicy::Follow)
+    }));
+
+    let mut resp = client
+        .get(&format!("http://127.0.0.1:{port}/a"))
+        .expect("GET failed");
+    assert_eq!(resp.body_string().unwrap(), "landed at c");
+    // Policy runs before each of the two redirects, seeing via lengths 1 then 2.
+    assert_eq!(*seen.lock().unwrap(), vec![1, 2]);
 }
 
 // ---------------------------------------------------------------------------
@@ -896,4 +985,165 @@ fn method_wildcard_precedence() {
         .expect("POST /things/99");
     assert_eq!(post_resp.status, status::OK);
     assert_eq!(post_resp.header.get("X-Handler"), Some("any-method"));
+}
+
+// ---------------------------------------------------------------------------
+// Client timeout — slow server, client-wide timeout fires
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn client_timeout_fires_on_slow_server() {
+    let port = next_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mux = Arc::new(ServeMux::new());
+    mux.handle_func("/slow", |w, _| {
+        go_lib::sleep(Duration::from_secs(3));
+        let _ = w.write(b"too late");
+    });
+    start_server_goroutine(addr, mux);
+
+    let mut client = Client::new();
+    client.timeout = Some(Duration::from_millis(200));
+
+    let start = std::time::Instant::now();
+    match client.get(&format!("http://127.0.0.1:{port}/slow")) {
+        Ok(_)  => panic!("expected a timeout, got a response"),
+        Err(e) => assert!(matches!(e, HttpError::Timeout), "got: {e:?}"),
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "client should time out promptly, took {:?}",
+        start.elapsed(),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Client timeout — fast server responds within the timeout window
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn client_timeout_allows_fast_response() {
+    let port = next_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mux = Arc::new(ServeMux::new());
+    mux.handle_func("/ping", |w, _| { let _ = w.write(b"pong"); });
+    start_server_goroutine(addr, mux);
+
+    let mut client = Client::new();
+    client.timeout = Some(Duration::from_secs(5));
+
+    let mut resp = client
+        .get(&format!("http://127.0.0.1:{port}/ping"))
+        .expect("fast response should not time out");
+    assert_eq!(resp.status, status::OK);
+    assert_eq!(resp.body_string().unwrap(), "pong");
+}
+
+// ---------------------------------------------------------------------------
+// Per-request context deadline propagates (no client-wide timeout)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn per_request_context_deadline_fires() {
+    let port = next_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mux = Arc::new(ServeMux::new());
+    mux.handle_func("/slow", |w, _| {
+        go_lib::sleep(Duration::from_secs(3));
+        let _ = w.write(b"too late");
+    });
+    start_server_goroutine(addr, mux);
+
+    let (ctx, _cancel) =
+        go_lib::context::with_timeout(&go_lib::context::background(), Duration::from_millis(200));
+    let req = go_http::request::Request::new_with_context(
+        "GET",
+        &format!("http://127.0.0.1:{port}/slow"),
+        None,
+        ctx,
+    )
+    .unwrap();
+
+    // Client has no timeout of its own; the deadline comes from the request.
+    let client = Client::new();
+    match client.do_request(req) {
+        Ok(_)  => panic!("expected a timeout from the request context"),
+        Err(e) => assert!(matches!(e, HttpError::Timeout), "got: {e:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP proxy — request sent to the proxy in absolute-form
+// ---------------------------------------------------------------------------
+
+#[test]
+#[go_lib::main]
+fn http_proxy_uses_absolute_form() {
+    use go_http::client::Transport;
+    use go_lib::net::TcpListener;
+    use std::io::Write;
+
+    // Mock proxy: capture the request line, reply with a canned 200.
+    let proxy_port = next_port();
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    let listener = TcpListener::bind(proxy_addr.as_str()).unwrap();
+
+    let captured: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let cap2 = Arc::clone(&captured);
+    go_lib::go!(move || {
+        let mut conn = listener.accept().unwrap();
+        let mut buf = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            match conn.read(&mut b) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    buf.push(b[0]);
+                    if buf.ends_with(b"\r\n\r\n") { break; }
+                }
+            }
+        }
+        *cap2.lock().unwrap() = String::from_utf8_lossy(&buf).to_string();
+        let body = b"via proxy";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = conn.write_all(resp.as_bytes());
+        let _ = conn.write_all(body);
+    });
+    go_lib::sleep(Duration::from_millis(50));
+
+    // A real url::Url for the proxy, obtained without naming the `url` crate.
+    let proxy_url = go_http::request::Request::new(
+        "GET",
+        &format!("http://{proxy_addr}/"),
+        None,
+    )
+    .unwrap()
+    .url;
+
+    let mut transport = Transport::new();
+    transport.proxy = Some(Arc::new(move |_req| Ok(Some(proxy_url.clone()))));
+    let mut client = Client::new();
+    client.transport = Arc::new(transport);
+
+    let mut resp = client
+        .get("http://origin.example/thing?x=1")
+        .expect("proxied GET failed");
+    assert_eq!(resp.status, status::OK);
+    assert_eq!(resp.body_string().unwrap(), "via proxy");
+
+    let captured = captured.lock().unwrap();
+    assert!(
+        captured.starts_with("GET http://origin.example/thing?x=1 HTTP/1.1\r\n"),
+        "proxy should receive an absolute-form request-target, got: {captured:?}",
+    );
+    assert!(captured.contains("Host: origin.example\r\n"), "got: {captured:?}");
 }

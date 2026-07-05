@@ -13,6 +13,11 @@ pub enum HttpError {
     InvalidUrl(String),
     Timeout,
     TooManyRedirects,
+    /// A redirect policy (`Client.check_redirect`) aborted the request.
+    /// Port of the error returned by Go's `CheckRedirect`.
+    Redirect(String),
+    /// A proxy failure (e.g. a failed `CONNECT` tunnel, or a bad proxy URL).
+    Proxy(String),
     BodyRead,
     Mime(String),
     Tls(String),
@@ -26,6 +31,8 @@ impl fmt::Display for HttpError {
             Self::InvalidUrl(s)    => write!(f, "invalid URL: {s}"),
             Self::Timeout          => write!(f, "request timed out"),
             Self::TooManyRedirects => write!(f, "too many redirects"),
+            Self::Redirect(s)      => write!(f, "redirect blocked: {s}"),
+            Self::Proxy(s)         => write!(f, "proxy error: {s}"),
             Self::BodyRead         => write!(f, "error reading body"),
             Self::Mime(s)          => write!(f, "mime error: {s}"),
             Self::Tls(s)           => write!(f, "TLS error: {s}"),
