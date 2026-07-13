@@ -74,7 +74,7 @@ fn alpn_negotiates_h2() {
     let addr = start_tls_server(mux);
 
     let client = tls_client();
-    let mut resp = client.get(&format!("https://localhost:{}/hello", addr.split(':').nth(1).unwrap())).unwrap();
+    let mut resp = client.get(&format!("https://{addr}/hello")).unwrap();
     assert_eq!(resp.status, 200);
     assert_eq!(resp.proto, "HTTP/2.0", "client must negotiate h2 via ALPN");
     assert_eq!(resp.body_string().unwrap(), "hello over TLS");
@@ -89,13 +89,12 @@ fn alpn_h2_post_roundtrip() {
         let _ = w.write(&body);
     });
     let addr = start_tls_server(mux);
-    let port = addr.split(':').nth(1).unwrap().to_owned();
 
     let client = tls_client();
     let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 241) as u8).collect();
     let body = Body::Unbounded(Box::new(std::io::Cursor::new(payload.clone())));
     let mut resp = client
-        .post(&format!("https://localhost:{port}/echo"), "application/octet-stream", body)
+        .post(&format!("https://{addr}/echo"), "application/octet-stream", body)
         .unwrap();
     assert_eq!(resp.status, 200);
     assert_eq!(resp.proto, "HTTP/2.0");
@@ -114,11 +113,10 @@ fn h2_tls_connection_is_pooled() {
         let _ = w.write(b"ok");
     });
     let addr = start_tls_server(mux);
-    let port = addr.split(':').nth(1).unwrap().to_owned();
 
     let client = tls_client();
     for _ in 0..5 {
-        let mut resp = client.get(&format!("https://localhost:{port}/r")).unwrap();
+        let mut resp = client.get(&format!("https://{addr}/r")).unwrap();
         assert_eq!(resp.status, 200);
         let _ = resp.body_bytes();
     }
@@ -139,7 +137,6 @@ fn http1_only_client_config_still_works() {
         let _ = w.write(r.proto.as_bytes());
     });
     let addr = start_tls_server(mux);
-    let port = addr.split(':').nth(1).unwrap().to_owned();
 
     let base = go_http::tls::client_config_with_ca(&testdata("ca.pem")).unwrap();
     let mut cfg = (*base).clone();
@@ -150,7 +147,7 @@ fn http1_only_client_config_still_works() {
     let mut client = Client::new();
     client.transport = Arc::new(transport);
 
-    let mut resp = client.get(&format!("https://localhost:{port}/proto")).unwrap();
+    let mut resp = client.get(&format!("https://{addr}/proto")).unwrap();
     assert_eq!(resp.status, 200);
     assert_eq!(resp.proto, "HTTP/1.1");
     assert_eq!(resp.body_string().unwrap(), "HTTP/1.1");
