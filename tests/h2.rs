@@ -756,16 +756,10 @@ fn h2c_idle_timeout_closes_connection() {
     });
     wait_until_ready(&addr);
 
+    // Connect (preface + SETTINGS) and then stay completely silent: any
+    // later write (e.g. a SETTINGS ack) races the idle close — unread bytes
+    // at close turn the FIN into an RST, discarding the buffered GOAWAY.
     let mut c = RawH2::connect(&addr);
-    // Answer the server SETTINGS, then go idle.
-    loop {
-        if let Frame::Settings { ack: false, .. } = c.read_frame() {
-            let mut buf = Vec::new();
-            frame::write_frame(&mut buf, frame::TYPE_SETTINGS, flags::ACK, 0, &[]);
-            c.stream.write_all(&buf).unwrap();
-            break;
-        }
-    }
 
     // With no streams, the idle watchdog must GOAWAY and close within a
     // couple of intervals.
