@@ -51,12 +51,16 @@ enum WriteInner {
 /// holder's lifetime, so a late shutdown can never hit an unrelated socket
 /// that recycled the number.
 pub fn split_plain(stream: TcpStream) -> io::Result<(H2ReadHalf, H2WriteHalf, TcpStream)> {
-    let ctl = stream.try_clone()?;
+    // The read half parks in overlapped/netpoll reads; give it a dup and
+    // keep the original as the control handle, mirroring the HTTP/1.1 serve
+    // loop's arrangement (shutdown on the original reliably completes a
+    // pending read parked on a dup across platforms).
+    let read  = stream.try_clone()?;
     let write = stream.try_clone()?;
     Ok((
-        H2ReadHalf(ReadInner::Plain(stream)),
+        H2ReadHalf(ReadInner::Plain(read)),
         H2WriteHalf(WriteInner::Plain(write)),
-        ctl,
+        stream,
     ))
 }
 
@@ -70,13 +74,15 @@ pub fn split_tls(
     sock: TcpStream,
 ) -> io::Result<(H2ReadHalf, H2WriteHalf, TcpStream)> {
     debug_assert!(!conn.is_handshaking(), "split_tls requires a completed handshake");
-    let ctl = sock.try_clone()?;
+    // As in split_plain: the parked read half gets a dup, the original is
+    // the control handle used for shutdown.
+    let sock_r = sock.try_clone()?;
     let sock_w = sock.try_clone()?;
     let conn = Arc::new(Mutex::new(conn));
     Ok((
-        H2ReadHalf(ReadInner::Tls { conn: Arc::clone(&conn), sock, pending: Vec::new() }),
+        H2ReadHalf(ReadInner::Tls { conn: Arc::clone(&conn), sock: sock_r, pending: Vec::new() }),
         H2WriteHalf(WriteInner::Tls { conn, sock: sock_w }),
-        ctl,
+        sock,
     ))
 }
 
