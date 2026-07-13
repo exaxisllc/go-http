@@ -24,7 +24,8 @@ fn testdata(file: &str) -> String {
     format!("{}/testdata/{file}", env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Start a TLS server (ALPN h2 + http/1.1) on its own goroutine.
+/// Start a TLS server (ALPN h2 + http/1.1) on its own goroutine and wait
+/// until it accepts connections (a fixed sleep races on slow CI runners).
 fn start_tls_server(mux: Arc<ServeMux>) -> String {
     let port = next_port();
     let addr = format!("127.0.0.1:{port}");
@@ -34,8 +35,20 @@ fn start_tls_server(mux: Arc<ServeMux>) -> String {
         srv.handler = Some(mux);
         let _ = srv.listen_and_serve_tls(&testdata("cert.pem"), &testdata("key.pem"));
     });
-    go_lib::sleep(Duration::from_millis(80));
+    wait_until_ready(&addr);
     addr
+}
+
+/// Probe-connect until the listener is up (the probe connection is dropped
+/// immediately; the server's failed handshake on it is harmless).
+fn wait_until_ready(addr: &str) {
+    for _ in 0..250 {
+        if go_lib::net::TcpStream::connect(addr).is_ok() {
+            return;
+        }
+        go_lib::sleep(Duration::from_millis(20));
+    }
+    panic!("server at {addr} did not become ready");
 }
 
 /// A client that trusts the testdata CA (and therefore offers h2 via ALPN,

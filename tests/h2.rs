@@ -23,7 +23,8 @@ fn next_port() -> u16 {
     PORT.fetch_add(1, Ordering::SeqCst)
 }
 
-/// Start an h2c-enabled server on its own goroutine; returns the address.
+/// Start an h2c-enabled server on its own goroutine and wait until it
+/// accepts connections (a fixed sleep races on slow CI runners).
 fn start_h2c_server(mux: Arc<ServeMux>) -> String {
     let port = next_port();
     let addr = format!("127.0.0.1:{port}");
@@ -34,8 +35,20 @@ fn start_h2c_server(mux: Arc<ServeMux>) -> String {
         srv.enable_h2c = true;
         let _ = srv.listen_and_serve();
     });
-    go_lib::sleep(Duration::from_millis(50));
+    wait_until_ready(&addr);
     addr
+}
+
+/// Probe-connect until the listener is up.  The probe connection is dropped
+/// immediately; the server sees a zero-byte connection and moves on.
+fn wait_until_ready(addr: &str) {
+    for _ in 0..250 {
+        if go_lib::net::TcpStream::connect(addr).is_ok() {
+            return;
+        }
+        go_lib::sleep(Duration::from_millis(20));
+    }
+    panic!("server at {addr} did not become ready");
 }
 
 /// A minimal raw h2 client for driving the server directly.
@@ -698,7 +711,7 @@ fn server_shutdown_sends_goaway_and_drains() {
     go_lib::go!(move || {
         let _ = srv2.listen_and_serve();
     });
-    go_lib::sleep(Duration::from_millis(50));
+    wait_until_ready(&addr);
 
     // Kick off an in-flight request, then shut the server down mid-handler.
     let (result_tx, result_rx) = go_lib::chan::chan::<Option<String>>(1);
@@ -741,7 +754,7 @@ fn h2c_idle_timeout_closes_connection() {
         srv.idle_timeout = Some(Duration::from_millis(80));
         let _ = srv.listen_and_serve();
     });
-    go_lib::sleep(Duration::from_millis(50));
+    wait_until_ready(&addr);
 
     let mut c = RawH2::connect(&addr);
     // Answer the server SETTINGS, then go idle.
@@ -783,7 +796,7 @@ fn h2c_oversized_header_list_gets_431() {
         srv.max_header_bytes = 4096; // advertised as MAX_HEADER_LIST_SIZE
         let _ = srv.listen_and_serve();
     });
-    go_lib::sleep(Duration::from_millis(50));
+    wait_until_ready(&addr);
 
     let mut c = RawH2::connect(&addr);
     let mut fields = request_fields("GET", &addr, "/");
