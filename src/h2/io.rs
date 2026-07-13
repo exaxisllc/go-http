@@ -44,14 +44,19 @@ enum WriteInner {
 }
 
 /// Split a plain TCP stream into independent read and write halves.
-/// Also returns a [`RawFdHandle`] for unblocking a parked reader.
-pub fn split_plain(stream: TcpStream) -> io::Result<(H2ReadHalf, H2WriteHalf, RawFdHandle)> {
-    let raw = RawFdHandle::of(&stream);
+///
+/// Also returns an owned control dup of the socket: holders use
+/// `RawFdHandle::of(&ctl)` to interrupt a parked reader.  Owning the dup —
+/// rather than capturing a raw fd — keeps the fd number valid for the
+/// holder's lifetime, so a late shutdown can never hit an unrelated socket
+/// that recycled the number.
+pub fn split_plain(stream: TcpStream) -> io::Result<(H2ReadHalf, H2WriteHalf, TcpStream)> {
+    let ctl = stream.try_clone()?;
     let write = stream.try_clone()?;
     Ok((
         H2ReadHalf(ReadInner::Plain(stream)),
         H2WriteHalf(WriteInner::Plain(write)),
-        raw,
+        ctl,
     ))
 }
 
@@ -63,15 +68,15 @@ pub fn split_plain(stream: TcpStream) -> io::Result<(H2ReadHalf, H2WriteHalf, Ra
 pub fn split_tls(
     conn: rustls::Connection,
     sock: TcpStream,
-) -> io::Result<(H2ReadHalf, H2WriteHalf, RawFdHandle)> {
+) -> io::Result<(H2ReadHalf, H2WriteHalf, TcpStream)> {
     debug_assert!(!conn.is_handshaking(), "split_tls requires a completed handshake");
-    let raw = RawFdHandle::of(&sock);
+    let ctl = sock.try_clone()?;
     let sock_w = sock.try_clone()?;
     let conn = Arc::new(Mutex::new(conn));
     Ok((
         H2ReadHalf(ReadInner::Tls { conn: Arc::clone(&conn), sock, pending: Vec::new() }),
         H2WriteHalf(WriteInner::Tls { conn, sock: sock_w }),
-        raw,
+        ctl,
     ))
 }
 
@@ -194,13 +199,15 @@ impl Write for H2WriteHalf {
 // RawFdHandle — unblock a parked reader by shutting the socket down
 // ---------------------------------------------------------------------------
 
-/// A non-owning view of the connection's socket, used to interrupt a
-/// goroutine parked in `read` (go-lib's `TcpStream` has no `shutdown`).
-///
-/// Same technique as the idle-timeout watchdog in `server.rs`: rebuild a
+/// A non-owning view of a socket, used to interrupt a goroutine parked in
+/// `read` (go-lib's `TcpStream` has no `shutdown`): rebuild a
 /// `std::net::TcpStream` from the raw fd, call `shutdown`, then `forget` it
-/// so the fd is not double-closed.  The handle must not be used after the
-/// owning stream is dropped.
+/// so the fd is not double-closed.
+///
+/// Construct it **at call time from a stream you own** (typically a
+/// `try_clone` dup held for exactly this purpose) — never store the handle
+/// beyond the owning stream's lifetime, or a fired shutdown can hit an
+/// unrelated socket that recycled the fd number.
 #[derive(Clone, Copy)]
 pub struct RawFdHandle {
     #[cfg(unix)]

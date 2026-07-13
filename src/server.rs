@@ -331,41 +331,28 @@ fn serve_conn(
         Err(_) => return,
     };
 
-    // Raw fd/socket used by the idle-timeout watchdog to interrupt read_request().
-    // The handle remains valid for the lifetime of `stream`; the watchdog takes
-    // a non-owning view via from_raw_fd/from_raw_socket + forget.
-    #[cfg(unix)]
-    let raw_fd = stream.as_raw_fd();
-    #[cfg(windows)]
-    let raw_socket = stream.as_raw_socket() as u64;
-
     loop {
         // ── Idle timeout watchdog ─────────────────────────────────────────────
         // Spawn a goroutine that fires after `idle_timeout` and shuts down the
         // read side of the socket, causing read_request() to return an error.
         // Cancelled by sending on idle_cancel_tx when the read completes.
+        //
+        // The watchdog OWNS a dup of the socket: a raw fd captured here could
+        // outlive the connection and shut down whatever unrelated socket
+        // reuses the fd number.  Holding the dup keeps the fd valid for the
+        // watchdog's lifetime; firing on an already-abandoned connection is
+        // then harmless.
         let (idle_cancel_tx, idle_cancel_rx) = go_lib::chan::chan::<()>(1);
-        if let Some(dur) = idle_timeout {
+        if let Some(dur) = idle_timeout
+            && let Ok(watchdog_sock) = stream.try_clone()
+        {
             let (ctx, _cancel) = go_lib::context::with_timeout(
                 &go_lib::context::background(), dur,
             );
             go_lib::go!(move || {
                 go_lib::select! {
                     recv(ctx.done())     -> _sig => {
-                        #[cfg(unix)] {
-                            use std::os::unix::io::FromRawFd;
-                            // SAFETY: raw_fd is valid while stream is alive; forget
-                            // prevents double-close since from_raw_fd takes ownership.
-                            let s = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
-                            let _ = s.shutdown(std::net::Shutdown::Read);
-                            std::mem::forget(s);
-                        }
-                        #[cfg(windows)] {
-                            use std::os::windows::io::FromRawSocket;
-                            let s = unsafe { std::net::TcpStream::from_raw_socket(raw_socket) };
-                            let _ = s.shutdown(std::net::Shutdown::Read);
-                            std::mem::forget(s);
-                        }
+                        crate::h2::io::RawFdHandle::of(&watchdog_sock).shutdown_read();
                     }
                     recv(idle_cancel_rx) -> _sig => {}
                 }
@@ -380,7 +367,10 @@ fn serve_conn(
         // closed, but the original `stream` (and `write_half`) remain open.
         let read_half = match stream.try_clone() {
             Ok(s)  => s,
-            Err(_) => break,
+            Err(_) => {
+                let _ = idle_cancel_tx.try_send(());
+                break;
+            }
         };
 
         // The first request may need to replay bytes consumed by the h2c
@@ -394,7 +384,10 @@ fn serve_conn(
         };
         let parsed = match result {
             Ok(p)  => { let _ = idle_cancel_tx.try_send(()); p }
-            Err(_) => break,
+            Err(_) => {
+                let _ = idle_cancel_tx.try_send(());
+                break;
+            }
         };
 
         let connection_close = {
@@ -530,12 +523,6 @@ fn serve_conn_tls(
         .map(|a| a.to_string())
         .unwrap_or_default();
 
-    // Capture raw fd/socket before moving stream into StreamOwned.
-    #[cfg(unix)]
-    let raw_fd = stream.as_raw_fd();
-    #[cfg(windows)]
-    let raw_socket = stream.as_raw_socket() as u64;
-
     let server_conn = match ServerConnection::new(tls_config) {
         Ok(c)  => c,
         Err(_) => return,
@@ -568,26 +555,19 @@ fn serve_conn_tls(
 
     loop {
         // ── Idle timeout watchdog ─────────────────────────────────────────────
+        // The watchdog owns a dup of the socket so a late firing can never hit
+        // a recycled fd number (see the plain-HTTP watchdog above).
         let (idle_cancel_tx, idle_cancel_rx) = go_lib::chan::chan::<()>(1);
-        if let Some(dur) = idle_timeout {
+        if let Some(dur) = idle_timeout
+            && let Ok(watchdog_sock) = tls.sock.try_clone()
+        {
             let (ctx, _cancel) = go_lib::context::with_timeout(
                 &go_lib::context::background(), dur,
             );
             go_lib::go!(move || {
                 go_lib::select! {
                     recv(ctx.done())     -> _sig => {
-                        #[cfg(unix)] {
-                            use std::os::unix::io::FromRawFd;
-                            let s = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
-                            let _ = s.shutdown(std::net::Shutdown::Read);
-                            std::mem::forget(s);
-                        }
-                        #[cfg(windows)] {
-                            use std::os::windows::io::FromRawSocket;
-                            let s = unsafe { std::net::TcpStream::from_raw_socket(raw_socket) };
-                            let _ = s.shutdown(std::net::Shutdown::Read);
-                            std::mem::forget(s);
-                        }
+                        crate::h2::io::RawFdHandle::of(&watchdog_sock).shutdown_read();
                     }
                     recv(idle_cancel_rx) -> _sig => {}
                 }
@@ -603,7 +583,10 @@ fn serve_conn_tls(
         let read_ptr: *mut dyn Read = &mut tls as &mut dyn Read as *mut dyn Read;
         let parsed = match read_request(RawTlsRead(read_ptr), max_header_bytes) {
             Ok(p)  => { let _ = idle_cancel_tx.try_send(()); p }
-            Err(_) => break,
+            Err(_) => {
+                let _ = idle_cancel_tx.try_send(());
+                break;
+            }
         };
 
         let connection_close = {

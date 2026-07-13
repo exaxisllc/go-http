@@ -56,8 +56,8 @@ pub struct H2ServerConfig {
 /// already been consumed by the preface sniffer.
 pub fn serve_h2c(stream: TcpStream, handler: Arc<dyn Handler>, cfg: H2ServerConfig) {
     let remote_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-    let Ok((r, w, raw)) = split_plain(stream) else { return };
-    serve_h2(r, w, raw, false, remote_addr, handler, cfg);
+    let Ok((r, w, ctl)) = split_plain(stream) else { return };
+    serve_h2(r, w, ctl, false, remote_addr, handler, cfg);
 }
 
 /// Serve h2 over TLS.  The handshake must be complete and ALPN must have
@@ -69,8 +69,8 @@ pub fn serve_h2_tls(
     cfg:     H2ServerConfig,
 ) {
     let remote_addr = sock.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-    let Ok((r, w, raw)) = split_tls(rustls::Connection::Server(conn), sock) else { return };
-    serve_h2(r, w, raw, true, remote_addr, handler, cfg);
+    let Ok((r, w, ctl)) = split_tls(rustls::Connection::Server(conn), sock) else { return };
+    serve_h2(r, w, ctl, true, remote_addr, handler, cfg);
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +138,7 @@ impl ServerShared {
 fn serve_h2(
     mut r:        H2ReadHalf,
     w:            super::io::H2WriteHalf,
-    raw:          RawFdHandle,
+    ctl:          TcpStream,
     expect_magic: bool,
     remote_addr:  String,
     handler:      Arc<dyn Handler>,
@@ -178,8 +178,10 @@ fn serve_h2(
     // ── Shutdown watchdog ────────────────────────────────────────────────────
     // Waits for Server::shutdown() (context cancel); sends GOAWAY, lets open
     // streams drain, then unblocks the parked reader via socket shutdown.
+    // Owns its dup of the socket so a late firing can never hit a recycled
+    // fd number.
     let (conn_done_tx, conn_done_rx) = chan::<()>(1);
-    {
+    if let Ok(watchdog_sock) = ctl.try_clone() {
         let shared = Arc::clone(&shared);
         let ctx = cfg.shutdown_ctx.clone();
         go_lib::go!(move || {
@@ -189,7 +191,7 @@ fn serve_h2(
                     while shared.open_count() > 0 {
                         go_lib::sleep(Duration::from_millis(20));
                     }
-                    raw.shutdown_read();
+                    RawFdHandle::of(&watchdog_sock).shutdown_read();
                 }
                 recv(conn_done_rx) -> _sig => {}
             }
@@ -199,19 +201,26 @@ fn serve_h2(
     // ── Idle timeout ─────────────────────────────────────────────────────────
     // A connection is idle when it has no open streams.  Checked at the
     // configured interval; two consecutive idle observations with no
-    // intervening stream activity close the connection.
+    // intervening stream activity close the connection.  Owns its socket dup
+    // (see above) and exits once the connection's writer is gone.
     let last_activity = Arc::new(AtomicU32::new(0)); // generation counter
-    if let Some(idle) = cfg.idle_timeout {
+    if let Some(idle) = cfg.idle_timeout
+        && let Ok(watchdog_sock) = ctl.try_clone()
+    {
         let shared = Arc::clone(&shared);
         let last_activity = Arc::clone(&last_activity);
+        let conn_dead = Arc::clone(&writer_handle.dead);
         go_lib::go!(move || {
             let mut seen = last_activity.load(Ordering::Relaxed);
             loop {
                 go_lib::sleep(idle);
+                if conn_dead.load(Ordering::Acquire) {
+                    return; // connection already torn down
+                }
                 let now = last_activity.load(Ordering::Relaxed);
                 if shared.open_count() == 0 && now == seen {
                     shared.begin_goaway();
-                    raw.shutdown_read();
+                    RawFdHandle::of(&watchdog_sock).shutdown_read();
                     return;
                 }
                 seen = now;

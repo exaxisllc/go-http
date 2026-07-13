@@ -69,14 +69,16 @@ pub struct ClientConn {
     /// wire in increasing order (RFC 9113 §5.1.1).  Goroutine-aware: safe to
     /// hold across the writer-channel send.
     wmu:            GoMutex,
-    raw:            RawFdHandle,
+    /// Owned control dup of the socket: keeps the fd valid for `close()`
+    /// even after the reader/writer goroutines have dropped their halves.
+    ctl:            TcpStream,
 }
 
 impl ClientConn {
     /// Establish h2 over a plain TCP stream (prior knowledge).
     pub fn new_plain(stream: TcpStream) -> Result<Arc<ClientConn>, H2Error> {
-        let (r, w, raw) = split_plain(stream).map_err(H2Error::Io)?;
-        Self::start(r, w, raw)
+        let (r, w, ctl) = split_plain(stream).map_err(H2Error::Io)?;
+        Self::start(r, w, ctl)
     }
 
     /// Establish h2 over a completed TLS session (ALPN selected `h2`).
@@ -84,14 +86,14 @@ impl ClientConn {
         conn: rustls::ClientConnection,
         sock: TcpStream,
     ) -> Result<Arc<ClientConn>, H2Error> {
-        let (r, w, raw) = split_tls(rustls::Connection::Client(conn), sock).map_err(H2Error::Io)?;
-        Self::start(r, w, raw)
+        let (r, w, ctl) = split_tls(rustls::Connection::Client(conn), sock).map_err(H2Error::Io)?;
+        Self::start(r, w, ctl)
     }
 
     fn start(
         r:   H2ReadHalf,
         mut w: H2WriteHalf,
-        raw: RawFdHandle,
+        ctl: TcpStream,
     ) -> Result<Arc<ClientConn>, H2Error> {
         // Client preface goes out before any frame.
         w.write_all(PREFACE).map_err(H2Error::Io)?;
@@ -114,7 +116,7 @@ impl ClientConn {
                 dead: false,
             })),
             wmu: GoMutex::new(),
-            raw,
+            ctl,
         });
 
         // Reader goroutine.  TLS_IO_STACK: on TLS connections this goroutine
@@ -140,7 +142,9 @@ impl ClientConn {
 
     /// Actively close the connection (pool eviction).  In-flight streams fail.
     pub fn close(&self) {
-        self.raw.shutdown_both();
+        // `ctl` is an owned dup, so the fd is valid for as long as `self`
+        // lives — the shutdown can never hit a recycled fd number.
+        RawFdHandle::of(&self.ctl).shutdown_both();
     }
 
     // ── round_trip ───────────────────────────────────────────────────────────
