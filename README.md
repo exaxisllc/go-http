@@ -59,6 +59,12 @@ cargo run --example h2_tls_server &
 curl -vk --http2 https://127.0.0.1:8443/hello
 ```
 
+**Known limitation (Windows):** go-lib's IOCP backend cannot yet interrupt a
+parked read via socket shutdown, so HTTP/2 idle-timeout closes and
+`Server::shutdown()` draining of open HTTP/2 connections do not unblock the
+connection reader on Windows — connections close when the peer disconnects.
+Tracked as a go-lib `net_windows` follow-up.
+
 ## Quick Start
 
 ### Run the Hello Server
