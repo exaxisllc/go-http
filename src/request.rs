@@ -158,7 +158,7 @@ impl Request {
         let mut out = Vec::new();
         if let Some(ref mut body) = self.body {
             body.read_to_end(&mut out).map_err(|_| HttpError::BodyRead)?;
-            self.trailer = body.trailers().clone();
+            self.trailer = body.trailers();
         }
         Ok(out)
     }

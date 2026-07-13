@@ -14,10 +14,10 @@ exclude = ["target"]
 categories = ["web-programming", "web-programming::http-client", "web-programming::http-server"]
 
 [dependencies]
-go-lib = "0.6.2"
-go-lib-macros = "0.6.2"
+go-lib = "0.6.3"
+go-lib-macros = "0.6.3"
 url = "2"
 base64 = "0.22"
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
 webpki-roots = "0.26"

@@ -21,6 +21,8 @@ pub enum HttpError {
     BodyRead,
     Mime(String),
     Tls(String),
+    /// An HTTP/2 protocol error (connection error, stream reset, GOAWAY, …).
+    Http2(crate::h2::H2Error),
 }
 
 impl fmt::Display for HttpError {
@@ -36,6 +38,7 @@ impl fmt::Display for HttpError {
             Self::BodyRead         => write!(f, "error reading body"),
             Self::Mime(s)          => write!(f, "mime error: {s}"),
             Self::Tls(s)           => write!(f, "TLS error: {s}"),
+            Self::Http2(e)         => write!(f, "http2 error: {e}"),
         }
     }
 }
@@ -45,6 +48,7 @@ impl std::error::Error for HttpError {
         match self {
             Self::Io(e)    => Some(e),
             Self::Parse(e) => Some(e),
+            Self::Http2(e) => Some(e),
             _              => None,
         }
     }
@@ -59,6 +63,12 @@ impl From<io::Error> for HttpError {
 impl From<ParseError> for HttpError {
     fn from(e: ParseError) -> Self {
         Self::Parse(e)
+    }
+}
+
+impl From<crate::h2::H2Error> for HttpError {
+    fn from(e: crate::h2::H2Error) -> Self {
+        Self::Http2(e)
     }
 }
 

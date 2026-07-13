@@ -52,6 +52,12 @@ pub struct Server {
     /// with 413 before the handler runs.  Chunked bodies are wrapped in a
     /// capped reader that returns an error when the limit is exceeded.
     pub max_body_bytes: Option<u64>,
+    /// Accept HTTP/2 prior-knowledge (h2c) connections on the plain listener.
+    /// When set, each connection's first bytes are sniffed for the HTTP/2
+    /// client preface; matching connections are served as HTTP/2, everything
+    /// else falls through to HTTP/1.1 unchanged.  Off by default, mirroring
+    /// Go (which requires the golang.org/x/net/http2/h2c wrapper).
+    pub enable_h2c: bool,
     /// Populated by `listen_and_serve`; send `()` to request shutdown.
     shutdown_tx: Mutex<Option<Sender<()>>>,
     /// Tracks the number of active connections.  `shutdown()` waits on this
@@ -69,6 +75,7 @@ impl Server {
             idle_timeout:     None,
             max_header_bytes: DEFAULT_MAX_HEADER_BYTES,
             max_body_bytes:   None,
+            enable_h2c:       false,
             shutdown_tx:      Mutex::new(None),
             active_conns:     Arc::new(WaitGroup::new()),
         }
@@ -90,11 +97,17 @@ impl Server {
         let max_header_bytes = self.max_header_bytes;
         let max_body_bytes   = self.max_body_bytes;
         let idle_timeout     = self.idle_timeout;
+        let enable_h2c       = self.enable_h2c;
         let active_conns     = Arc::clone(&self.active_conns);
 
         // Shutdown signal (buffered so shutdown() never blocks).
         let (shutdown_tx, shutdown_rx) = chan::<()>(1);
         *self.shutdown_tx.lock().unwrap() = Some(shutdown_tx);
+
+        // Cancelled when the dispatch loop exits; open HTTP/2 connections
+        // observe this and send a graceful GOAWAY.
+        let (h2_ctx, h2_cancel) =
+            go_lib::context::with_cancel(&go_lib::context::background());
 
         // Channel that delivers accepted connections to the dispatch loop.
         let (conn_tx, conn_rx) = chan::<TcpStream>(8);
@@ -125,11 +138,13 @@ impl Server {
                     match conn {
                         None         => break,
                         Some(stream) => {
-                            let h  = Arc::clone(&handler);
-                            let wg = Arc::clone(&active_conns);
+                            let h   = Arc::clone(&handler);
+                            let wg  = Arc::clone(&active_conns);
+                            let ctx = h2_ctx.clone();
                             wg.add(1);
                             go_lib::go!(move || {
-                                serve_conn(stream, h, max_header_bytes, max_body_bytes, idle_timeout);
+                                serve_conn(stream, h, max_header_bytes, max_body_bytes,
+                                           idle_timeout, enable_h2c, ctx);
                                 wg.done();
                             });
                         }
@@ -138,6 +153,8 @@ impl Server {
             }
         }
 
+        // Signal open HTTP/2 connections to drain gracefully.
+        h2_cancel.cancel();
         Ok(())
     }
 
@@ -154,7 +171,9 @@ impl Server {
         cert_file: &str,
         key_file:  &str,
     ) -> Result<(), HttpError> {
-        let tls_config = crate::tls::server_config(cert_file, key_file)?;
+        // ALPN offers h2 + http/1.1; the per-connection serve loop dispatches
+        // on whichever protocol is negotiated.
+        let tls_config = crate::tls::server_config_h2(cert_file, key_file)?;
         let listener   = TcpListener::bind(&self.addr as &str).map_err(HttpError::Io)?;
 
         let handler: Arc<dyn Handler> = match &self.handler {
@@ -168,6 +187,9 @@ impl Server {
 
         let (shutdown_tx, shutdown_rx) = chan::<()>(1);
         *self.shutdown_tx.lock().unwrap() = Some(shutdown_tx);
+
+        let (h2_ctx, h2_cancel) =
+            go_lib::context::with_cancel(&go_lib::context::background());
 
         let (conn_tx, conn_rx) = chan::<TcpStream>(8);
 
@@ -194,9 +216,13 @@ impl Server {
                             let h   = Arc::clone(&handler);
                             let cfg = Arc::clone(&tls_config);
                             let wg  = Arc::clone(&active_conns);
+                            let ctx = h2_ctx.clone();
                             wg.add(1);
-                            go_lib::go!(move || {
-                                serve_conn_tls(stream, cfg, h, max_header_bytes, max_body_bytes, idle_timeout);
+                            // Big initial stack: the TLS handshake runs on
+                            // this goroutine (see tls::TLS_HANDSHAKE_STACK).
+                            go_lib::spawn_with_stack(crate::tls::TLS_HANDSHAKE_STACK, move || {
+                                serve_conn_tls(stream, cfg, h, max_header_bytes,
+                                               max_body_bytes, idle_timeout, ctx);
                                 wg.done();
                             });
                         }
@@ -205,6 +231,8 @@ impl Server {
             }
         }
 
+        // Signal open HTTP/2 connections to drain gracefully.
+        h2_cancel.cancel();
         Ok(())
     }
 
@@ -237,13 +265,62 @@ impl Server {
 /// The write half is cloned once at the start; the read half is re-cloned for
 /// each request so `read_request` can take ownership of it (and attach it to
 /// the body reader) while the write half remains available for the response.
+///
+/// With `enable_h2c`, the connection's first bytes are sniffed: an HTTP/2
+/// client preface hands the connection to the h2 serve loop; anything else is
+/// replayed into the HTTP/1.1 parser via `PrefixedRead`.
 fn serve_conn(
     stream:           TcpStream,
     handler:          Arc<dyn Handler>,
     max_header_bytes: usize,
     max_body_bytes:   Option<u64>,
     idle_timeout:     Option<Duration>,
+    enable_h2c:       bool,
+    h2_ctx:           go_lib::context::Context,
 ) {
+    // ── h2c preface sniff ─────────────────────────────────────────────────
+    let mut initial: Option<Vec<u8>> = None;
+    if enable_h2c {
+        let preface = crate::h2::PREFACE;
+        let mut sniffed = Vec::with_capacity(preface.len());
+        let mut matches = true;
+        {
+            // go-lib implements Read for &TcpStream.
+            let mut r = &stream;
+            let mut tmp = [0u8; 24];
+            while sniffed.len() < preface.len() {
+                let want = preface.len() - sniffed.len();
+                match r.read(&mut tmp[..want]) {
+                    Ok(0) | Err(_) => {
+                        matches = false;
+                        break;
+                    }
+                    Ok(n) => {
+                        sniffed.extend_from_slice(&tmp[..n]);
+                        if sniffed[..] != preface[..sniffed.len()] {
+                            matches = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if matches && sniffed.len() == preface.len() {
+            crate::h2::server::serve_h2c(
+                stream,
+                handler,
+                crate::h2::server::H2ServerConfig {
+                    max_header_bytes,
+                    max_body_bytes,
+                    idle_timeout,
+                    shutdown_ctx: h2_ctx,
+                },
+            );
+            return;
+        }
+        initial = Some(sniffed);
+    }
+
     let remote_addr = stream.peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_default();
@@ -306,7 +383,16 @@ fn serve_conn(
             Err(_) => break,
         };
 
-        let parsed = match read_request(read_half, max_header_bytes) {
+        // The first request may need to replay bytes consumed by the h2c
+        // preface sniffer.
+        let result = match initial.take() {
+            Some(prefix) if !prefix.is_empty() => read_request(
+                PrefixedRead { prefix: io::Cursor::new(prefix), inner: read_half },
+                max_header_bytes,
+            ),
+            _ => read_request(read_half, max_header_bytes),
+        };
+        let parsed = match result {
             Ok(p)  => { let _ = idle_cancel_tx.try_send(()); p }
             Err(_) => break,
         };
@@ -389,6 +475,23 @@ fn serve_conn(
 // TLS connection handler
 // ---------------------------------------------------------------------------
 
+/// Replays bytes consumed by the h2c preface sniffer ahead of the live
+/// stream, so the HTTP/1.1 parser sees the connection from byte zero.
+struct PrefixedRead<R: Read> {
+    prefix: io::Cursor<Vec<u8>>,
+    inner:  R,
+}
+
+impl<R: Read> Read for PrefixedRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.prefix.read(buf)?;
+        if n > 0 {
+            return Ok(n);
+        }
+        self.inner.read(buf)
+    }
+}
+
 /// A raw-pointer `Read` wrapper that "lends" an `impl Read` to `read_request`
 /// without giving up ownership.
 ///
@@ -421,6 +524,7 @@ fn serve_conn_tls(
     max_header_bytes: usize,
     max_body_bytes:   Option<u64>,
     idle_timeout:     Option<Duration>,
+    h2_ctx:           go_lib::context::Context,
 ) {
     let remote_addr = stream.peer_addr()
         .map(|a| a.to_string())
@@ -437,6 +541,30 @@ fn serve_conn_tls(
         Err(_) => return,
     };
     let mut tls = rustls::StreamOwned::new(server_conn, stream);
+
+    // Complete the handshake so ALPN is decided before the first read.
+    while tls.conn.is_handshaking() {
+        if tls.conn.complete_io(&mut tls.sock).is_err() {
+            return;
+        }
+    }
+
+    // ── ALPN dispatch ─────────────────────────────────────────────────────
+    if tls.conn.alpn_protocol() == Some(b"h2") {
+        let rustls::StreamOwned { conn, sock } = tls;
+        crate::h2::server::serve_h2_tls(
+            conn,
+            sock,
+            handler,
+            crate::h2::server::H2ServerConfig {
+                max_header_bytes,
+                max_body_bytes,
+                idle_timeout,
+                shutdown_ctx: h2_ctx,
+            },
+        );
+        return;
+    }
 
     loop {
         // ── Idle timeout watchdog ─────────────────────────────────────────────

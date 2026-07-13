@@ -1,15 +1,16 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# go-http — HTTP/1.1 Server & Client in Rust
+# go-http — HTTP/1.1 + HTTP/2 Server & Client in Rust
 
 A faithful port of Go's `net/http` library to Rust, built on [go-lib](https://github.com/exaxisllc/go-lib) for goroutine-style concurrency.
 
-**Status:** Production-ready. All 98 tests passing. Full HTTP/1.1 support with TLS.
+**Status:** Production-ready. All 255 tests passing. Full HTTP/1.1 and HTTP/2 support with TLS.
 
 ## Features
 
 ### Server
 - **Goroutine-per-connection model** — each accepted connection spawns a lightweight goroutine
+- **HTTP/2** — negotiated via ALPN on TLS listeners; opt-in cleartext h2c (`Server.enable_h2c`) with prior-knowledge preface detection alongside HTTP/1.1 on the same port
 - **Keep-Alive support** — persistent connections reuse TCP sockets
 - **Chunked transfer encoding** — streams large responses without buffering
 - **Handler routing** — `ServeMux` with longest-prefix matching
@@ -17,6 +18,7 @@ A faithful port of Go's `net/http` library to Rust, built on [go-lib](https://gi
 - **TLS** — HTTPS via rustls with automatic certificate loading
 
 ### Client
+- **HTTP/2** — automatic via ALPN for `https://` (interops with nghttp2, Google, Cloudflare); opt-in cleartext prior knowledge (`Transport.h2c_prior_knowledge`); one multiplexed connection per origin shared by concurrent requests
 - **Connection pooling** — idle TCP connections reused per host
 - **Redirect following** — automatic POST→GET on 301/302/303, respecting `max_redirects`
 - **Cookie jar** — automatic cookie storage and transmission
@@ -24,9 +26,38 @@ A faithful port of Go's `net/http` library to Rust, built on [go-lib](https://gi
 
 ### HTTP
 - **RFC 7231 parsing** — request/response line, headers, trailers
+- **RFC 9113 HTTP/2** — full frame layer, stream multiplexing, flow control both directions, graceful GOAWAY shutdown; server push disabled by design
+- **RFC 7541 HPACK** — hand-rolled header compression incl. Huffman coding and the dynamic table, validated byte-for-byte against the RFC test vectors
 - **Content negotiation** — Content-Length vs Transfer-Encoding, 1xx/204/304 handling
 - **MIME types** — detect, parse, format media types with RFC 2231 continuations
 - **Form encoding** — `application/x-www-form-urlencoded` client support
+
+## HTTP/2
+
+HTTP/2 needs no configuration on HTTPS: `listen_and_serve_tls` offers
+`h2` + `http/1.1` via ALPN, and the client speaks whichever the server
+selects.  For cleartext HTTP/2 (useful for local testing and internal
+services), enable it explicitly on both sides:
+
+```rust
+// Server: same port serves HTTP/1.1 and prior-knowledge HTTP/2.
+let mut srv = Server::new("127.0.0.1:8080");
+srv.enable_h2c = true;
+
+// Client: speak HTTP/2 to http:// URLs without an upgrade dance.
+let mut transport = Transport::new();
+transport.h2c_prior_knowledge = true;
+```
+
+Try it with curl:
+
+```bash
+cargo run --example h2_server &
+curl -v --http2-prior-knowledge http://127.0.0.1:8080/hello
+
+cargo run --example h2_tls_server &
+curl -vk --http2 https://127.0.0.1:8443/hello
+```
 
 ## Quick Start
 
@@ -91,6 +122,9 @@ All examples run under `go_lib::run()` so goroutines and channels are available:
 | `static_files` | File serving with prefix stripping |
 | `client_get` | HTTP client library usage |
 | `middleware` | Composable handler middleware (logging + timeout) |
+| `h2_server` | HTTP/2 cleartext (h2c) server, same port as HTTP/1.1 |
+| `h2_tls_server` | HTTPS server negotiating HTTP/2 via ALPN |
+| `h2_client` | HTTP/2 client (`--h2c` for cleartext prior knowledge) |
 
 Run with: `cargo run --example <name>`
 

@@ -3,6 +3,7 @@
 pub mod context;
 pub mod cookie;
 pub mod error;
+pub mod h2;
 pub mod handler;
 pub mod header;
 pub mod method;

@@ -14,6 +14,18 @@ use crate::header::Header;
 // Body — the opaque body reader type
 // ---------------------------------------------------------------------------
 
+/// A body reader that can surface trailer headers after the body ends.
+///
+/// HTTP/2 bodies implement this: trailers arrive in a trailing HEADERS frame
+/// rather than inside a chunked encoding, so the reader itself carries them.
+pub trait TrailerRead: Read + Send {
+    /// Trailer headers, available once the body has been fully consumed.
+    /// The default implementation reports none.
+    fn trailers(&self) -> Header {
+        Header::new()
+    }
+}
+
 /// An HTTP message body.
 pub enum Body {
     /// Body of exactly `n` bytes.
@@ -26,6 +38,8 @@ pub enum Body {
     Empty,
     /// Any body wrapped with a hard byte cap; returns an error on overflow.
     Capped { inner: Box<Body>, remaining: u64 },
+    /// A reader with optional trailer support (used by HTTP/2 bodies).
+    Reader(Box<dyn TrailerRead>),
 }
 
 impl Read for Body {
@@ -35,6 +49,7 @@ impl Read for Body {
             Self::Chunked(r)   => r.read(buf),
             Self::Unbounded(r) => r.read(buf),
             Self::Empty        => Ok(0),
+            Self::Reader(r)    => r.read(buf),
             Self::Capped { inner, remaining } => {
                 if buf.is_empty() {
                     return Ok(0);
@@ -75,22 +90,27 @@ impl Body {
         Body::Capped { inner: Box::new(self), remaining: limit }
     }
 
-    /// Return trailer headers if this is a chunked body that has been fully
-    /// read.  Returns an empty header for all other body types.
-    pub fn trailers(&self) -> &Header {
-        static EMPTY: std::sync::OnceLock<Header> = std::sync::OnceLock::new();
+    /// Return trailer headers if this body carries them (chunked or
+    /// trailer-capable readers) and has been fully read.  Returns an empty
+    /// header for all other body types.
+    ///
+    /// `Body::Reader` trailers are returned by value (they are assembled by
+    /// the reader), so this returns an owned `Header`.
+    pub fn trailers(&self) -> Header {
         match self {
-            Self::Chunked(r)              => &r.trailers,
-            Self::Capped { inner, .. }    => inner.trailers(),
-            _                             => EMPTY.get_or_init(Header::new),
+            Self::Chunked(r)           => r.trailers.clone(),
+            Self::Capped { inner, .. } => inner.trailers(),
+            Self::Reader(r)            => r.trailers(),
+            _                          => Header::new(),
         }
     }
 
-    /// Consume the body and return any trailer headers (chunked bodies only).
+    /// Consume the body and return any trailer headers.
     pub fn into_trailers(self) -> Header {
         match self {
             Self::Chunked(r)           => r.trailers,
             Self::Capped { inner, .. } => inner.into_trailers(),
+            Self::Reader(r)            => r.trailers(),
             _                          => Header::new(),
         }
     }
