@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "go-http"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "base64",
  "go-lib",
