@@ -657,7 +657,7 @@ fn chunked_trailers_roundtrip() {
         let n = reader.read_line(&mut line).unwrap_or(0);
         if n == 0 { break; }
         if line.to_ascii_lowercase().starts_with("x-got-checksum:") {
-            let val = line.splitn(2, ':').nth(1).unwrap_or("").trim().to_owned();
+            let val = line.split_once(':').map(|x| x.1).unwrap_or("").trim().to_owned();
             assert_eq!(val, "abc123", "trailer not echoed correctly: {val:?}");
             found_checksum = true;
             break;
@@ -726,7 +726,7 @@ fn graceful_shutdown_waits() {
     let mut body = String::new();
     BufReader::new(stream)
         .lines()
-        .filter_map(Result::ok)
+        .map_while(Result::ok)
         .for_each(|l| body.push_str(&l));
     assert!(body.contains("done"), "expected 'done' in response, got: {body:?}");
 }
@@ -790,7 +790,7 @@ fn idle_timeout_closes_connection() {
 
     // The server should have shut down the read side; any further read returns 0.
     let n = stream.try_clone()
-        .and_then(|mut s| s.read(&mut buf).map_err(|e| e.into()))
+        .and_then(|mut s| s.read(&mut buf))
         .unwrap_or(0);
     assert_eq!(n, 0, "expected EOF after idle timeout, got {n} bytes");
 }

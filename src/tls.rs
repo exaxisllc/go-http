@@ -12,6 +12,20 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::error::HttpError;
 
+/// Initial stack size for goroutines that perform a TLS handshake.
+///
+/// rustls + ring handshake call chains are deep and park-free, and ring's
+/// hand-written assembly (e.g. `p256_point_mul`) allocates multi-page frames
+/// without stack probes — go-lib's reactive (signal-time) stack growth cannot
+/// recover from that.  Starting on a large stack avoids growth entirely; the
+/// memory is virtual until touched.
+pub(crate) const TLS_HANDSHAKE_STACK: usize = 1 << 20; // 1 MiB
+
+/// Initial stack size for goroutines that do post-handshake TLS record
+/// processing (AES-GCM seal/open — much shallower than the handshake, but
+/// debug-build frames are wide enough to warrant headroom).
+pub(crate) const TLS_IO_STACK: usize = 256 * 1024;
+
 // ---------------------------------------------------------------------------
 // Server TLS config
 // ---------------------------------------------------------------------------
@@ -31,6 +45,25 @@ pub fn server_config(
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| HttpError::Tls(e.to_string()))?;
+
+    Ok(Arc::new(cfg))
+}
+
+/// Like [`server_config`], but advertises HTTP/2 via ALPN
+/// (`["h2", "http/1.1"]`).  Used by `listen_and_serve_tls`; the serve loop
+/// dispatches on the negotiated protocol.
+pub fn server_config_h2(
+    cert_file: &str,
+    key_file:  &str,
+) -> Result<Arc<rustls::ServerConfig>, HttpError> {
+    let certs = load_certs(cert_file)?;
+    let key   = load_private_key(key_file)?;
+
+    let mut cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| HttpError::Tls(e.to_string()))?;
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(Arc::new(cfg))
 }
@@ -56,6 +89,35 @@ pub fn default_client_config() -> Arc<rustls::ClientConfig> {
                 .with_no_client_auth(),
         )
     }))
+}
+
+/// Like [`default_client_config`], but offers HTTP/2 via ALPN
+/// (`["h2", "http/1.1"]`).  The `Transport` uses this for HTTPS requests;
+/// whichever protocol the server selects is spoken.
+pub fn h2_client_config() -> Arc<rustls::ClientConfig> {
+    use std::sync::OnceLock;
+    static CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    Arc::clone(CFG.get_or_init(|| {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let mut cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Arc::new(cfg)
+    }))
+}
+
+/// Return `cfg` with HTTP/2 ALPN added when the config specifies no ALPN of
+/// its own.  A config that already sets `alpn_protocols` is respected as-is
+/// (e.g. a deliberately HTTP/1.1-only client).
+pub(crate) fn with_h2_alpn(cfg: &Arc<rustls::ClientConfig>) -> Arc<rustls::ClientConfig> {
+    if !cfg.alpn_protocols.is_empty() {
+        return Arc::clone(cfg);
+    }
+    let mut c = (**cfg).clone();
+    c.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Arc::new(c)
 }
 
 /// Build a `rustls::ClientConfig` that trusts a custom PEM CA certificate file
@@ -94,4 +156,78 @@ fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, HttpError> {
     rustls_pemfile::private_key(&mut r)
         .map_err(|e| HttpError::Tls(e.to_string()))?
         .ok_or_else(|| HttpError::Tls(format!("no private key found in {path}")))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn testdata(file: &str) -> String {
+        format!("{}/testdata/{file}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    #[test]
+    fn server_config_loads_cert_and_key() {
+        let cfg = server_config(&testdata("cert.pem"), &testdata("key.pem")).unwrap();
+        assert!(cfg.alpn_protocols.is_empty(), "plain config advertises no ALPN");
+    }
+
+    #[test]
+    fn server_config_h2_sets_alpn() {
+        let cfg = server_config_h2(&testdata("cert.pem"), &testdata("key.pem")).unwrap();
+        assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn server_config_missing_files_error() {
+        assert!(matches!(
+            server_config("/nonexistent/cert.pem", "/nonexistent/key.pem"),
+            Err(HttpError::Io(_))
+        ));
+        // Cert exists but the key file has no key material in it.
+        assert!(matches!(
+            server_config(&testdata("cert.pem"), &testdata("ca.pem")),
+            Err(HttpError::Tls(_))
+        ));
+    }
+
+    #[test]
+    fn client_configs_and_alpn() {
+        // The two cached configs differ only in ALPN.
+        assert!(default_client_config().alpn_protocols.is_empty());
+        assert_eq!(
+            h2_client_config().alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+
+        // with_h2_alpn adds ALPN only when the config has none of its own.
+        let plain = client_config_with_ca(&testdata("ca.pem")).unwrap();
+        let upgraded = with_h2_alpn(&plain);
+        assert_eq!(
+            upgraded.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+
+        let mut pinned = (*plain).clone();
+        pinned.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let pinned = std::sync::Arc::new(pinned);
+        let kept = with_h2_alpn(&pinned);
+        assert_eq!(kept.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn client_config_with_ca_errors() {
+        assert!(matches!(
+            client_config_with_ca("/nonexistent/ca.pem"),
+            Err(HttpError::Io(_))
+        ));
+        // A key file contains no certificates: the config builds but adds no
+        // extra roots beyond Mozilla's (certs() yields nothing) — accept Ok,
+        // or a Tls error on malformed PEM; either way it must not panic.
+        let _ = client_config_with_ca(&testdata("key.pem"));
+    }
 }

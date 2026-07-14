@@ -52,9 +52,16 @@ pub struct Transport {
     pub tls_config: Option<Arc<rustls::ClientConfig>>,
     /// Proxy resolver.  `None` connects directly.  See [`proxy_from_environment`].
     pub proxy: Option<ProxyFn>,
+    /// Speak HTTP/2 with prior knowledge on cleartext `http://` connections
+    /// (no upgrade dance; the server must support h2c).  Off by default.
+    /// HTTPS connections negotiate HTTP/2 via ALPN independently of this flag.
+    pub h2c_prior_knowledge: bool,
     /// Idle connection pool keyed by `"host:port"` (the dial target — the proxy
     /// when proxying, else the origin).
     pool: Mutex<HashMap<String, VecDeque<IdleConn>>>,
+    /// Multiplexed HTTP/2 connections, keyed by `"scheme|host:port"`.
+    /// One shared connection per origin; evicted when no longer reusable.
+    h2_pool: Mutex<HashMap<String, Arc<crate::h2::client::ClientConn>>>,
 }
 
 impl Transport {
@@ -65,7 +72,9 @@ impl Transport {
             dial_timeout:            Some(Duration::from_secs(30)),
             tls_config:              None,
             proxy:                   None,
+            h2c_prior_knowledge:     false,
             pool:                    Mutex::new(HashMap::new()),
+            h2_pool:                 Mutex::new(HashMap::new()),
         }
     }
 
@@ -120,6 +129,8 @@ impl RoundTripper for Transport {
             None => {
                 if is_https {
                     self.https_round_trip(req, &host, &target_hp, None)
+                } else if self.h2c_prior_knowledge {
+                    self.h2_round_trip(req, "h2c", &target_hp)
                 } else {
                     self.http_round_trip(req, &target_hp, false)
                 }
@@ -177,49 +188,215 @@ impl Transport {
         Ok(parsed_response_to_response(parsed))
     }
 
-    /// HTTPS round-trip.  When `proxy` is `Some((proxy_hp, auth))`, a `CONNECT`
-    /// tunnel to `target_hp` is established through the proxy first; otherwise
-    /// `target_hp` is dialled directly.  TLS is then negotiated using `sni_host`.
-    /// TLS connections are not pooled.
+    /// HTTPS round-trip.  Runs [`https_round_trip_inner`] on a dedicated
+    /// goroutine with a large initial stack: the rustls/ring handshake call
+    /// chain is deep, park-free, and includes assembly with unprobed
+    /// multi-page frames that go-lib's reactive stack growth cannot recover
+    /// (see `tls::TLS_HANDSHAKE_STACK`).  The calling goroutine parks on a
+    /// one-shot channel meanwhile.
     fn https_round_trip(
         &self,
-        mut req: Request,
+        req: Request,
         sni_host: &str,
         target_hp: &str,
         proxy: Option<(String, Option<String>)>,
     ) -> Result<Response, HttpError> {
-        let stream = match proxy {
-            Some((proxy_hp, auth)) => {
-                let mut s = TcpStream::connect(proxy_hp.as_str()).map_err(HttpError::Io)?;
-                connect_tunnel(&mut s, target_hp, auth.as_deref())?;
-                s
+        // The h2-pool fast path performs no TLS work — take it on the
+        // calling goroutine.
+        let pool_key = match &proxy {
+            Some((proxy_hp, _)) => format!("https|{target_hp}|{proxy_hp}"),
+            None                => format!("https|{target_hp}|-"),
+        };
+        let pooled = {
+            let pool = self.h2_pool.lock().unwrap();
+            pool.get(&pool_key).filter(|cc| cc.is_reusable()).map(Arc::clone)
+        };
+        let mut req = Some(req);
+        if let Some(cc) = pooled {
+            let retry_snapshot = req.as_ref().and_then(|r| {
+                r.body.is_none().then(|| snapshot_request(r))
+            });
+            match cc.round_trip(req.take().unwrap()) {
+                Err(HttpError::Http2(
+                    e @ (crate::h2::H2Error::Closed | crate::h2::H2Error::GoAway(..)),
+                )) => {
+                    // Stale pooled conn: evict and fall through to a fresh
+                    // dial (body-less requests only).
+                    self.h2_pool.lock().unwrap().remove(&pool_key);
+                    match retry_snapshot {
+                        Some(snap) => req = Some(snap),
+                        None       => return Err(HttpError::Http2(e)),
+                    }
+                }
+                other => return other,
             }
-            None => TcpStream::connect(target_hp).map_err(HttpError::Io)?,
+        }
+        let req = req.take().unwrap();
+
+        // Fresh connection: handshake on a big-stack goroutine.
+        let (tx, rx) = go_lib::chan::chan::<Result<Response, HttpError>>(1);
+        // SAFETY of the borrows: we park until the spawned goroutine sends
+        // its result, so `self` and the string slices outlive its execution.
+        // The goroutine requires 'static, so clone what it captures.
+        let sni_host  = sni_host.to_owned();
+        let target_hp = target_hp.to_owned();
+        let tls_config = self.tls_config.clone();
+        let h2_pool_insert = {
+            // Channel to hand a freshly established h2 conn back for pooling.
+            let (cc_tx, cc_rx) = go_lib::chan::chan::<Arc<crate::h2::client::ClientConn>>(1);
+            go_lib::spawn_with_stack(crate::tls::TLS_HANDSHAKE_STACK, move || {
+                let result = https_handshake_and_dispatch(
+                    req, &sni_host, &target_hp, proxy, tls_config, &cc_tx,
+                );
+                let _ = std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| tx.send(result)),
+                );
+            });
+            cc_rx
         };
 
-        let tls_cfg = match &self.tls_config {
-            Some(c) => Arc::clone(c),
-            None    => crate::tls::default_client_config(),
-        };
-        let server_name = rustls::pki_types::ServerName::try_from(sni_host.to_owned())
-            .map_err(|e| HttpError::Tls(e.to_string()))?;
-        let client_conn = rustls::ClientConnection::new(tls_cfg, server_name)
-            .map_err(|e| HttpError::Tls(e.to_string()))?;
-        let mut tls = rustls::StreamOwned::new(client_conn, stream);
+        let result = rx.recv().unwrap_or(Err(HttpError::Http2(crate::h2::H2Error::Closed)));
 
-        // Origin-form over the (possibly tunnelled) TLS connection.
-        send_request(&mut tls, &mut req, false)?;
+        // Pool the h2 connection if one was established (after the fact —
+        // a lost dial race is resolved by preferring the existing entry).
+        if let Some(Some(cc)) = h2_pool_insert.try_recv() {
+            let mut pool = self.h2_pool.lock().unwrap();
+            if !pool.get(&pool_key).map(|e| e.is_reusable()).unwrap_or(false) {
+                pool.insert(pool_key, cc);
+            } else {
+                cc.close();
+            }
+        }
+        result
+    }
+}
 
-        // Lend `tls` to the response parser via a raw-pointer read wrapper.
-        // Safety: `tls` outlives the parser and the response body within this
-        // call frame; there is no concurrent access.
-        let read_ptr: *mut dyn Read = &mut tls as &mut dyn Read as *mut dyn Read;
-        let parsed = read_response(
-            RawRead(read_ptr),
-            Some(req.method.as_str()),
-            crate::parse::request::DEFAULT_MAX_HEADER_BYTES,
-        )?;
-        Ok(parsed_response_to_response(parsed))
+/// The TLS dial + handshake + protocol dispatch that must run on a
+/// large-stack goroutine.  On an h2 negotiation the new connection is also
+/// sent through `cc_tx` so the caller can pool it.
+fn https_handshake_and_dispatch(
+    mut req:    Request,
+    sni_host:   &str,
+    target_hp:  &str,
+    proxy:      Option<(String, Option<String>)>,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+    cc_tx:      &go_lib::chan::Sender<Arc<crate::h2::client::ClientConn>>,
+) -> Result<Response, HttpError> {
+    let stream = match proxy {
+        Some((proxy_hp, auth)) => {
+            let mut s = TcpStream::connect(proxy_hp.as_str()).map_err(HttpError::Io)?;
+            connect_tunnel(&mut s, target_hp, auth.as_deref())?;
+            s
+        }
+        None => TcpStream::connect(target_hp).map_err(HttpError::Io)?,
+    };
+
+    let tls_cfg = match &tls_config {
+        Some(c) => crate::tls::with_h2_alpn(c),
+        None    => crate::tls::h2_client_config(),
+    };
+    let server_name = rustls::pki_types::ServerName::try_from(sni_host.to_owned())
+        .map_err(|e| HttpError::Tls(e.to_string()))?;
+    let client_conn = rustls::ClientConnection::new(tls_cfg, server_name)
+        .map_err(|e| HttpError::Tls(e.to_string()))?;
+    let mut tls = rustls::StreamOwned::new(client_conn, stream);
+
+    // Complete the handshake so ALPN is decided before the first byte.
+    while tls.conn.is_handshaking() {
+        tls.conn
+            .complete_io(&mut tls.sock)
+            .map_err(|e| HttpError::Tls(e.to_string()))?;
+    }
+
+    // ── ALPN dispatch ─────────────────────────────────────────────────────
+    if tls.conn.alpn_protocol() == Some(b"h2") {
+        let rustls::StreamOwned { conn, sock } = tls;
+        let cc = crate::h2::client::ClientConn::new_tls(conn, sock)
+            .map_err(HttpError::Http2)?;
+        // Hand the connection back for pooling (buffered; never blocks).
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cc_tx.try_send(Arc::clone(&cc))
+        }));
+        return cc.round_trip(req);
+    }
+
+    // ── HTTP/1.1 over TLS ──────────────────────────────────────────────────
+    // Origin-form over the (possibly tunnelled) TLS connection.
+    send_request(&mut tls, &mut req, false)?;
+
+    // Lend `tls` to the response parser via a raw-pointer read wrapper.
+    // Safety: `tls` outlives the parser and the fully-buffered body below;
+    // there is no concurrent access.
+    let read_ptr: *mut dyn Read = &mut tls as &mut dyn Read as *mut dyn Read;
+    let mut parsed = read_response(
+        RawRead(read_ptr),
+        Some(req.method.as_str()),
+        crate::parse::request::DEFAULT_MAX_HEADER_BYTES,
+    )?;
+    // Buffer the body before `tls` (which the body reader points into) goes
+    // out of scope.  TLS connections are not pooled, so nothing is reused.
+    let bytes = parsed.body.read_to_vec().map_err(|_| HttpError::BodyRead)?;
+    parsed.body = Body::Unbounded(Box::new(io::Cursor::new(bytes)));
+    Ok(parsed_response_to_response(parsed))
+}
+
+impl Transport {
+    /// Round-trip over a pooled, multiplexed HTTP/2 connection.
+    ///
+    /// If the pooled connection turns out to be dead or draining (GOAWAY),
+    /// it is evicted and a body-less request is retried once on a fresh
+    /// connection, mirroring Go's stale-connection retry.  Requests with a
+    /// body are not retried — the body may be partially consumed.
+    fn h2_round_trip(
+        &self,
+        req:     Request,
+        scheme:  &str,
+        dial_hp: &str,
+    ) -> Result<Response, HttpError> {
+        let key = format!("{scheme}|{dial_hp}");
+        let retry_snapshot = req.body.is_none().then(|| snapshot_request(&req));
+
+        let cc = self.h2_conn(&key, dial_hp)?;
+        match cc.round_trip(req) {
+            Err(HttpError::Http2(
+                e @ (crate::h2::H2Error::Closed | crate::h2::H2Error::GoAway(..)),
+            )) => {
+                self.h2_pool.lock().unwrap().remove(&key);
+                match retry_snapshot {
+                    Some(snap) => {
+                        let fresh = self.h2_conn(&key, dial_hp)?;
+                        fresh.round_trip(snap)
+                    }
+                    None => Err(HttpError::Http2(e)),
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Fetch (or dial) the shared h2 connection for `key`.
+    fn h2_conn(
+        &self,
+        key:     &str,
+        dial_hp: &str,
+    ) -> Result<Arc<crate::h2::client::ClientConn>, HttpError> {
+        if let Some(cc) = self.h2_pool.lock().unwrap().get(key)
+            && cc.is_reusable()
+        {
+            return Ok(Arc::clone(cc));
+        }
+        let stream = TcpStream::connect(dial_hp).map_err(HttpError::Io)?;
+        let cc = crate::h2::client::ClientConn::new_plain(stream).map_err(HttpError::Http2)?;
+        let mut pool = self.h2_pool.lock().unwrap();
+        // Lost the dial race: prefer the existing reusable conn.
+        if let Some(existing) = pool.get(key)
+            && existing.is_reusable()
+        {
+            cc.close();
+            return Ok(Arc::clone(existing));
+        }
+        pool.insert(key.to_owned(), Arc::clone(&cc));
+        Ok(cc)
     }
 }
 
