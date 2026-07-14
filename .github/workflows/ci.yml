@@ -132,7 +132,12 @@ jobs:
     strategy:
       matrix:
         os: [ ubuntu-latest ]
-        toolchain: [ nightly ]
+        # Pinned: nightlies after 2026-07-13 ICE during macro expansion of
+        # `#[test] #[go_lib::main]` test functions under -C instrument-coverage
+        # ("attribute is missing tokens: ... rustc_test_entrypoint_marker",
+        # rustc_ast/src/attr/mod.rs:307).  Unpin to plain `nightly` once the
+        # upstream regression is fixed.
+        toolchain: [ nightly-2026-07-13 ]
     steps:
       - uses: actions/checkout@v4
       - name: Update tool chain

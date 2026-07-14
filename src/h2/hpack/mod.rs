@@ -50,3 +50,30 @@ impl HeaderField {
 pub fn list_size(fields: &[HeaderField]) -> u64 {
     fields.iter().map(HeaderField::size).sum()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn field_size_is_name_value_plus_32() {
+        // RFC 7541 §4.1: size = name len + value len + 32.
+        assert_eq!(HeaderField::new(":method", "GET").size(), 7 + 3 + 32);
+        assert_eq!(HeaderField::new("", "").size(), 32);
+    }
+
+    #[test]
+    fn list_size_sums_fields() {
+        let fields = [
+            HeaderField::new(":status", "200"), // 7 + 3 + 32 = 42
+            HeaderField::new("etag", "abc"),    // 4 + 3 + 32 = 39
+        ];
+        assert_eq!(list_size(&fields), 42 + 39);
+        assert_eq!(list_size(&[]), 0);
+    }
+
+    #[test]
+    fn new_is_not_sensitive_by_default() {
+        assert!(!HeaderField::new("cookie", "a=b").sensitive);
+    }
+}

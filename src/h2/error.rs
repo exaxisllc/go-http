@@ -154,4 +154,42 @@ mod tests {
         assert!(g.to_string().contains("last stream 7"));
         assert!(g.to_string().contains("bye"));
     }
+
+    #[test]
+    fn display_every_errcode() {
+        for v in 0u32..=0xd {
+            let text = ErrCode::from_u32(v).to_string();
+            assert!(!text.is_empty());
+            assert_eq!(text, text.to_ascii_uppercase(), "wire-style names: {text}");
+        }
+    }
+
+    #[test]
+    fn display_connection_closed_and_io() {
+        let c = H2Error::Connection(ErrCode::FrameSize, "too big".into());
+        assert_eq!(c.to_string(), "connection error FRAME_SIZE_ERROR: too big");
+
+        assert_eq!(H2Error::Closed.to_string(), "connection closed");
+
+        let io_err = H2Error::Io(io::Error::other("boom"));
+        assert!(io_err.to_string().contains("boom"));
+
+        // GOAWAY with empty debug text omits the trailing detail.
+        let g = H2Error::GoAway(1, ErrCode::Cancel, String::new());
+        assert!(!g.to_string().contains(": "));
+    }
+
+    #[test]
+    fn source_and_conversions() {
+        use std::error::Error;
+        let io_err: H2Error = io::Error::other("inner").into();
+        assert!(io_err.source().is_some());
+        assert!(H2Error::Closed.source().is_none());
+
+        // into_io preserves a real io::Error and wraps everything else.
+        let raw = io::Error::new(io::ErrorKind::TimedOut, "t");
+        assert_eq!(H2Error::Io(raw).into_io().kind(), io::ErrorKind::TimedOut);
+        let wrapped = H2Error::Stream(3, ErrCode::Cancel).into_io();
+        assert!(wrapped.to_string().contains("CANCEL"));
+    }
 }
