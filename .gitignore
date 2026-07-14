@@ -4,3 +4,4 @@
 
 # Generated at runtime by the static_files example.
 /examples/assets
+*.profraw
